@@ -2,6 +2,8 @@
 .envrc
 .direnv/
 result
+flake.nix
+flake.lock
 
 # python
 __pycache__/
