@@ -1,0 +1,8 @@
+# nix
+.envrc
+.direnv/
+result
+
+# python
+__pycache__/
+*.pyc
