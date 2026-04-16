@@ -67,29 +67,62 @@ def load_base_embedding() -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# STUB: Elata SDK wrapper
+# EEG source — real hardware or synthetic mock
 # Returns (mood, energy) as floats, each roughly in [-1, 1]
 # ---------------------------------------------------------------------------
 
 class EEGSource:
-    def __init__(self):
-        # STUB: initialise Elata SDK connection here
-        pass
+    """
+    Wraps hardware EEG or a synthetic mock for smoke-testing.
+
+    mood   ∈ [-1, 1]: valence axis (negative=unpleasant, positive=pleasant)
+    energy ∈ [-1, 1]: arousal axis (negative=calm/sleepy, positive=excited)
+    """
+
+    def __init__(self, mock: bool = False, smooth_window: int = 3):
+        self.mock = mock
+        self._history: deque = deque(maxlen=smooth_window)
+        self._t0 = time.time()
+
+        if not mock:
+            # STUB: initialise Elata SDK connection here, e.g.:
+            #   import elata
+            #   self._elata = elata.connect()
+            raise NotImplementedError(
+                "Real EEG not connected. Run with --mock-eeg for smoke testing."
+            )
 
     def read(self) -> tuple[float, float]:
-        """Return current (mood, energy) coordinate."""
+        """Return instantaneous (mood, energy) from hardware or mock."""
+        if self.mock:
+            return self._mock_read()
         # STUB: replace with actual Elata SDK call, e.g.:
-        #   state = elata.get_state()
-        #   return state.mood, state.energy
+        #   state = self._elata.get_state()
+        #   return float(state.mood), float(state.energy)
         raise NotImplementedError("Connect Elata SDK here")
 
-    def smooth(self, window: int = 3) -> tuple[float, float]:
+    def _mock_read(self) -> tuple[float, float]:
         """
-        Optional: return EMA-smoothed reading over `window` samples.
-        Useful because raw EEG is noisy — smoothing before RL reduces jitter.
-        STUB: implement if SDK doesn't smooth internally.
+        Synthetic EEG: slow sine-wave drift with small Gaussian noise.
+        Period is long enough that 10 s steps see meaningful change.
         """
-        raise NotImplementedError
+        t = time.time() - self._t0
+        mood   = 0.6 * np.sin(2 * np.pi * t / 60.0) + 0.1 * np.random.randn()
+        energy = 0.5 * np.cos(2 * np.pi * t / 90.0) + 0.1 * np.random.randn()
+        return float(np.clip(mood, -1, 1)), float(np.clip(energy, -1, 1))
+
+    def smooth(self) -> tuple[float, float]:
+        """
+        EMA-smoothed reading over the history window.
+        Calls read() internally; most-recent sample has highest weight.
+        """
+        self._history.append(self.read())
+        n       = len(self._history)
+        moods   = [h[0] for h in self._history]
+        energies= [h[1] for h in self._history]
+        weights = np.array([0.5 ** (n - 1 - i) for i in range(n)])
+        weights /= weights.sum()
+        return float(np.dot(weights, moods)), float(np.dot(weights, energies))
 
 
 # ---------------------------------------------------------------------------
@@ -257,15 +290,18 @@ def update_policy_reinforce(
 # Main loop
 # ---------------------------------------------------------------------------
 
-def run(explore_steps: int = 20):
+def run(explore_steps: int = 20, mock_eeg: bool = False):
     """
     explore_steps: number of random-action steps before policy takes over.
+    mock_eeg:      use synthetic sine-wave EEG instead of real hardware.
     During exploration the world model accumulates data before policy training.
     """
     print(f"Device: {DEVICE}")
+    if mock_eeg:
+        print("Using mock EEG (sine wave). Pass mock_eeg=False for real hardware.")
 
     # Init components
-    eeg       = EEGSource()
+    eeg       = EEGSource(mock=mock_eeg)
     generator = ImageGenerator()
     base_emb  = load_base_embedding()  # (1, SEQ_LEN, GEMMA_DIM), frozen, pre-computed offline
 
