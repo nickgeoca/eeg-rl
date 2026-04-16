@@ -8,3 +8,6 @@ flake.lock
 # python
 __pycache__/
 *.pyc
+
+# secrets
+token
