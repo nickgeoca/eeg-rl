@@ -255,17 +255,29 @@ class ReplayBuffer:
 # Display
 # ---------------------------------------------------------------------------
 
-def display_image(image: Image.Image):
+def display_image(image: Image.Image, fullscreen: bool = False):
     """
     Show image to the human subject.
-    STUB: replace with whatever display method fits your setup.
-    Options:
-      - image.show()                        simple, opens system viewer
-      - pygame window                       fullscreen, more control
-      - web server + browser fullscreen     if subject is remote
-      - secondary monitor via pyglet        for lab setups
+    fullscreen=True opens a fullscreen pygame window (requires: pip install pygame).
+    fullscreen=False uses the OS image viewer — fine for a first smoke test.
     """
-    image.show()  # STUB
+    if not fullscreen:
+        image.show()
+        return
+
+    import pygame  # noqa: deferred import — only needed in fullscreen mode
+
+    if not pygame.get_init():
+        pygame.init()
+        pygame.display.set_caption("EEG Neurofeedback")
+
+    info   = pygame.display.Info()
+    screen = pygame.display.set_mode((info.current_w, info.current_h), pygame.FULLSCREEN)
+    surface = pygame.image.fromstring(image.tobytes(), image.size, image.mode)
+    surface = pygame.transform.scale(surface, (info.current_w, info.current_h))
+    screen.blit(surface, (0, 0))
+    pygame.display.flip()
+    # pygame stays open; the STEP_SECONDS sleep in the main loop acts as display time.
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +404,7 @@ def run(
     save_path: str | None = "session.pt",
     save_interval: int = 10,
     dyna: bool = True,
+    fullscreen: bool = False,
 ):
     """
     explore_steps: number of random-action steps before policy takes over.
@@ -399,6 +412,7 @@ def run(
     save_path:     checkpoint file for session persistence; None disables saving.
     save_interval: save checkpoint every N steps.
     dyna:          whether to use world-model dreaming between real steps.
+    fullscreen:    display images fullscreen via pygame instead of image.show().
     During exploration the world model accumulates data before policy training.
     """
     print(f"Device: {DEVICE}")
@@ -429,11 +443,14 @@ def run(
     goal        = sample_goal_near(first_coord, goal_radius)
     goal_timer  = time.time()
 
-    # Graceful Ctrl-C: save checkpoint before exit
+    # Graceful Ctrl-C: save checkpoint and quit pygame before exit
     def _handle_sigint(sig, frame):
         print("\nSession ended by user.")
         if save_path:
             save_session(save_path, policy, projector, wm, step)
+        if fullscreen:
+            import pygame  # noqa
+            pygame.quit()
         raise SystemExit(0)
     signal.signal(signal.SIGINT, _handle_sigint)
 
@@ -458,8 +475,8 @@ def run(
         ).unsqueeze(0)  # (1, 4)
 
         if step < explore_steps:
-            # Random exploration: uniform delta in [-1, 1]
-            delta_t = torch.rand(1, DELTA_DIM, device=DEVICE) * 2 - 1
+            # Random exploration: scale down to 0.3 so images stay visually coherent
+            delta_t  = (torch.rand(1, DELTA_DIM, device=DEVICE) * 2 - 1) * 0.3
             log_prob = None
             print(f"  [explore {step+1}/{explore_steps}]", end="")
         else:
@@ -483,7 +500,7 @@ def run(
 
         # --- 5. Generate and display image ---
         image = generator.generate(final_emb.detach())
-        display_image(image)
+        display_image(image, fullscreen=fullscreen)
 
         # --- 6. Wait, then read new EEG state ---
         time.sleep(STEP_SECONDS)
@@ -535,6 +552,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Save checkpoint every N steps (default: 10).")
     p.add_argument("--no-dyna", action="store_true", default=False,
                    help="Disable world-model dreaming (pure online REINFORCE).")
+    p.add_argument("--fullscreen", action="store_true", default=False,
+                   help="Display images fullscreen via pygame (requires: pip install pygame).")
     return p.parse_args()
 
 
@@ -546,4 +565,5 @@ if __name__ == "__main__":
         save_path=None if args.no_save else args.save_path,
         save_interval=args.save_interval,
         dyna=not args.no_dyna,
+        fullscreen=args.fullscreen,
     )
