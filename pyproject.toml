@@ -6,4 +6,34 @@ dependencies = [
     "gymnasium",
     "numpy",
     "plotext",
+    "torch",
+    "diffusers",
+    "transformers",
+    "accelerate",
+    "sentencepiece",
+    "safetensors",
+    "xformers",
+    "huggingface-hub",
+    "llama-cpp-python",
 ]
+
+[project.optional-dependencies]
+# uv sync --extra cuda  →  CUDA torch/xformers
+# uv sync              →  CPU-only builds from PyPI
+cuda = ["torch", "xformers"]
+
+# When the 'cuda' extra is requested, pull torch/xformers from the CUDA 12.8
+# index instead of PyPI. Without --extra cuda, PyPI CPU wheels are used.
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "extra == 'cuda'" },
+]
+xformers = [
+    { index = "pytorch-cu128", marker = "extra == 'cuda'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
