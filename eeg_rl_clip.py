@@ -26,6 +26,7 @@ Pipeline per step:
 Stubs are marked with: # STUB
 """
 
+import argparse
 import time
 from collections import deque
 
@@ -392,5 +393,18 @@ def run(explore_steps: int = 20, mock_eeg: bool = False):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="EEG Neurofeedback RL with SANA-Sprint")
+    p.add_argument("--explore-steps", type=int, default=20,
+                   help="Random exploration steps before policy takes over (default: 20).")
+    p.add_argument("--mock-eeg", action="store_true", default=False,
+                   help="Use synthetic sine-wave EEG instead of real hardware.")
+    return p.parse_args()
+
+
 if __name__ == "__main__":
-    run(explore_steps=20)
+    args = _parse_args()
+    run(
+        explore_steps=args.explore_steps,
+        mock_eeg=args.mock_eeg,
+    )
