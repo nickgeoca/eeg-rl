@@ -27,6 +27,7 @@ Stubs are marked with: # STUB
 """
 
 import argparse
+import signal
 import time
 from collections import deque
 
@@ -301,13 +302,58 @@ def update_policy_reinforce(
 
 
 # ---------------------------------------------------------------------------
+# Session persistence
+# ---------------------------------------------------------------------------
+
+from pathlib import Path  # noqa: E402 — grouped with session helpers
+
+
+def save_session(
+    path: str,
+    policy: Policy,
+    projector: DeltaProjector,
+    wm: WorldModel,
+    step: int,
+):
+    torch.save({
+        "policy":    policy.state_dict(),
+        "projector": projector.state_dict(),
+        "wm":        wm.state_dict(),
+        "step":      step,
+    }, path)
+    print(f"  [saved → {path}  step={step}]")
+
+
+def load_session(
+    path: str,
+    policy: Policy,
+    projector: DeltaProjector,
+    wm: WorldModel,
+) -> int:
+    ckpt = torch.load(path, map_location=DEVICE)
+    policy.load_state_dict(ckpt["policy"])
+    projector.load_state_dict(ckpt["projector"])
+    wm.load_state_dict(ckpt["wm"])
+    step = ckpt.get("step", 0)
+    print(f"  [loaded {path}  resuming at step {step}]")
+    return step
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
-def run(explore_steps: int = 20, mock_eeg: bool = False):
+def run(
+    explore_steps: int = 20,
+    mock_eeg: bool = False,
+    save_path: str | None = "session.pt",
+    save_interval: int = 10,
+):
     """
     explore_steps: number of random-action steps before policy takes over.
     mock_eeg:      use synthetic sine-wave EEG instead of real hardware.
+    save_path:     checkpoint file for session persistence; None disables saving.
+    save_interval: save checkpoint every N steps.
     During exploration the world model accumulates data before policy training.
     """
     print(f"Device: {DEVICE}")
@@ -327,12 +373,24 @@ def run(explore_steps: int = 20, mock_eeg: bool = False):
     pol_opt = torch.optim.Adam(list(policy.parameters()) + list(projector.parameters()), lr=LR)
     wm_opt  = torch.optim.Adam(wm.parameters(), lr=LR)
 
+    # Load prior session if checkpoint exists
+    step = 0
+    if save_path and Path(save_path).exists():
+        step = load_session(save_path, policy, projector, wm)
+
     # Sample initial goal near the user's current EEG state
     first_coord = np.array(eeg.read(), dtype=np.float32)
     goal_radius = GOAL_RADIUS_INIT
     goal        = sample_goal_near(first_coord, goal_radius)
     goal_timer  = time.time()
-    step = 0
+
+    # Graceful Ctrl-C: save checkpoint before exit
+    def _handle_sigint(sig, frame):
+        print("\nSession ended by user.")
+        if save_path:
+            save_session(save_path, policy, projector, wm, step)
+        raise SystemExit(0)
+    signal.signal(signal.SIGINT, _handle_sigint)
 
     print("Starting neurofeedback loop. Ctrl-C to stop.")
     print(f"  First goal: mood={goal[0]:.2f}  energy={goal[1]:.2f}  radius={goal_radius:.2f}")
@@ -405,6 +463,12 @@ def run(explore_steps: int = 20, mock_eeg: bool = False):
 
         step += 1
 
+        # --- 11. Periodic checkpoint ---
+        if save_path and step % save_interval == 0:
+            save_session(save_path, policy, projector, wm, step)
+
+
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -416,6 +480,12 @@ def _parse_args() -> argparse.Namespace:
                    help="Random exploration steps before policy takes over (default: 20).")
     p.add_argument("--mock-eeg", action="store_true", default=False,
                    help="Use synthetic sine-wave EEG instead of real hardware.")
+    p.add_argument("--save-path", type=str, default="session.pt",
+                   help="Checkpoint file for session persistence (default: session.pt).")
+    p.add_argument("--no-save", action="store_true", default=False,
+                   help="Disable session persistence entirely.")
+    p.add_argument("--save-interval", type=int, default=10,
+                   help="Save checkpoint every N steps (default: 10).")
     return p.parse_args()
 
 
@@ -424,4 +494,6 @@ if __name__ == "__main__":
     run(
         explore_steps=args.explore_steps,
         mock_eeg=args.mock_eeg,
+        save_path=None if args.no_save else args.save_path,
+        save_interval=args.save_interval,
     )
