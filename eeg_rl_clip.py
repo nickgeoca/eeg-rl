@@ -57,6 +57,19 @@ LR             = 3e-4
 BASE_PROMPT    = "abstract generative art, neutral"  # used only in bake_base_embedding.py
 BASE_EMB_PATH  = "base_emb.pt"                       # pre-computed embedding, loaded at runtime
 
+GOAL_RADIUS_INIT = 0.3   # initial goal sampling radius around current EEG state
+GOAL_RADIUS_MAX  = 1.0   # maximum radius (expanded after each resample)
+GOAL_RADIUS_GROW = 0.05  # radius added per resample as system gains confidence
+
+
+def sample_goal_near(current: np.ndarray, radius: float) -> np.ndarray:
+    """
+    Sample a goal within `radius` of `current`, clipped to [-1, 1].
+    Starting near the current state avoids unachievable early goals.
+    """
+    offset = np.random.uniform(-radius, radius, size=current.shape).astype(np.float32)
+    return np.clip(current + offset, -1.0, 1.0)
+
 
 def load_base_embedding() -> torch.Tensor:
     """
@@ -314,13 +327,15 @@ def run(explore_steps: int = 20, mock_eeg: bool = False):
     pol_opt = torch.optim.Adam(list(policy.parameters()) + list(projector.parameters()), lr=LR)
     wm_opt  = torch.optim.Adam(wm.parameters(), lr=LR)
 
-    # Sample initial goal
-    goal = np.random.uniform(-1, 1, size=2).astype(np.float32)
-    goal_timer = time.time()
+    # Sample initial goal near the user's current EEG state
+    first_coord = np.array(eeg.read(), dtype=np.float32)
+    goal_radius = GOAL_RADIUS_INIT
+    goal        = sample_goal_near(first_coord, goal_radius)
+    goal_timer  = time.time()
     step = 0
 
     print("Starting neurofeedback loop. Ctrl-C to stop.")
-    print(f"  First goal: mood={goal[0]:.2f}  energy={goal[1]:.2f}")
+    print(f"  First goal: mood={goal[0]:.2f}  energy={goal[1]:.2f}  radius={goal_radius:.2f}")
 
     while True:
         # --- 1. Read current EEG state ---
@@ -328,9 +343,11 @@ def run(explore_steps: int = 20, mock_eeg: bool = False):
 
         # --- 2. Refresh goal if interval elapsed ---
         if time.time() - goal_timer > GOAL_INTERVAL:
-            goal = np.random.uniform(-1, 1, size=2).astype(np.float32)
-            goal_timer = time.time()
-            print(f"\n  New goal: mood={goal[0]:.2f}  energy={goal[1]:.2f}")
+            goal_radius = min(GOAL_RADIUS_MAX, goal_radius + GOAL_RADIUS_GROW)
+            goal        = sample_goal_near(coord, goal_radius)
+            goal_timer  = time.time()
+            print(f"\n  New goal: mood={goal[0]:.2f}  energy={goal[1]:.2f}"
+                  f"  radius={goal_radius:.2f}")
 
         # --- 3. Choose action (delta) ---
         obs = torch.tensor(
