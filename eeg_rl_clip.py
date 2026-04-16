@@ -301,6 +301,49 @@ def update_policy_reinforce(
     opt.step()
 
 
+def dyna_policy_update(
+    policy: Policy,
+    wm: WorldModel,
+    pol_opt: torch.optim.Optimizer,
+    replay: ReplayBuffer,
+    goal: np.ndarray,
+    n_steps: int = 5,
+):
+    """
+    Dyna-style: roll out n_steps imagined transitions through the world model
+    and update the policy on each. Starts from a random real coord in the
+    replay buffer; uses the world model as a cheap simulator so the policy
+    sees more transitions per unit of real time.
+
+    Does nothing if the replay buffer has fewer than BATCH_SIZE entries.
+    """
+    if len(replay) < BATCH_SIZE or n_steps == 0:
+        return
+
+    goal_t = torch.tensor(goal, dtype=torch.float32, device=DEVICE).unsqueeze(0)  # (1,2)
+    coords, _, _ = replay.sample(BATCH_SIZE)
+    coord = coords[torch.randint(len(coords), (1,))].detach()  # (1,2)
+
+    for _ in range(n_steps):
+        obs        = torch.cat([coord, goal_t], dim=-1)        # (1,4)
+        delta_mean = policy(obs)
+        noise      = torch.randn_like(delta_mean) * 0.1
+        delta_t    = delta_mean + noise
+        dist       = torch.distributions.Normal(delta_mean, 0.1)
+        log_prob   = dist.log_prob(delta_t).sum()
+
+        with torch.no_grad():
+            next_coord = wm(coord, delta_t).clamp(-1.0, 1.0)
+
+        reward = -float(torch.norm(next_coord - goal_t).item())
+        loss   = -log_prob * reward
+        pol_opt.zero_grad()
+        loss.backward()
+        pol_opt.step()
+
+        coord = next_coord.detach()
+
+
 # ---------------------------------------------------------------------------
 # Session persistence
 # ---------------------------------------------------------------------------
@@ -348,12 +391,14 @@ def run(
     mock_eeg: bool = False,
     save_path: str | None = "session.pt",
     save_interval: int = 10,
+    dyna: bool = True,
 ):
     """
     explore_steps: number of random-action steps before policy takes over.
     mock_eeg:      use synthetic sine-wave EEG instead of real hardware.
     save_path:     checkpoint file for session persistence; None disables saving.
     save_interval: save checkpoint every N steps.
+    dyna:          whether to use world-model dreaming between real steps.
     During exploration the world model accumulates data before policy training.
     """
     print(f"Device: {DEVICE}")
@@ -460,6 +505,8 @@ def run(
         # --- 10. Update policy (once past exploration) ---
         if step >= explore_steps and log_prob is not None:
             update_policy_reinforce(policy, pol_opt, log_prob, reward)
+            if dyna:
+                dyna_policy_update(policy, wm, pol_opt, replay, goal)
 
         step += 1
 
@@ -486,6 +533,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Disable session persistence entirely.")
     p.add_argument("--save-interval", type=int, default=10,
                    help="Save checkpoint every N steps (default: 10).")
+    p.add_argument("--no-dyna", action="store_true", default=False,
+                   help="Disable world-model dreaming (pure online REINFORCE).")
     return p.parse_args()
 
 
@@ -496,4 +545,5 @@ if __name__ == "__main__":
         mock_eeg=args.mock_eeg,
         save_path=None if args.no_save else args.save_path,
         save_interval=args.save_interval,
+        dyna=not args.no_dyna,
     )
