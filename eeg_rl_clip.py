@@ -99,31 +99,29 @@ class EEGSource:
 
 class ImageGenerator:
     def __init__(self):
-        # STUB: load SANA-Sprint pipeline:
-        #   from diffusers import SanaSprintPipeline
-        #   self.pipe = SanaSprintPipeline.from_pretrained(
-        #       "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
-        #       torch_dtype=torch.bfloat16,
-        #   ).to(DEVICE)
-        #   self.pipe.enable_model_cpu_offload()  # optional, saves VRAM
-        pass
+        from diffusers import SanaSprintPipeline
+
+        print("Loading SANA-Sprint 0.6B…")
+        self.pipe = SanaSprintPipeline.from_pretrained(
+            "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
+            torch_dtype=torch.bfloat16,
+        ).to(DEVICE)
+        # Uncomment to offload heavy blocks to CPU between steps (saves VRAM):
+        # self.pipe.enable_model_cpu_offload()
+        print("Pipeline ready.")
 
     def generate(self, prompt_embeds: torch.Tensor) -> Image.Image:
         """
         Generate image from a Gemma embedding (no text involved).
 
-        prompt_embeds: shape (1, SEQ_LEN, GEMMA_DIM) in bfloat16
-
-        Usage:
-            image = self.pipe(
-                prompt_embeds=prompt_embeds.to(torch.bfloat16),
-                num_inference_steps=2,   # one-step model; 1-2 steps is enough
-                guidance_scale=4.5,
-            ).images[0]
-
-        STUB: uncomment once pipeline is loaded.
+        prompt_embeds: shape (1, SEQ_LEN, GEMMA_DIM)
+        Returns: PIL Image
         """
-        raise NotImplementedError("Connect SANA-Sprint pipeline here")
+        return self.pipe(
+            prompt_embeds=prompt_embeds.to(torch.bfloat16),
+            num_inference_steps=2,   # one-step model; 1-2 steps is sufficient
+            guidance_scale=4.5,
+        ).images[0]
 
 
 # ---------------------------------------------------------------------------
