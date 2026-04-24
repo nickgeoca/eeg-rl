@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>EEG Neurofeedback</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; color: #eee; font-family: monospace; overflow: hidden; }
+    #display { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; display: none; }
+    #overlay {
+      position: fixed; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 16px; z-index: 10;
+      background: #000;
+    }
+    #overlay.hidden { display: none; }
+    h1 { font-size: 1.4rem; letter-spacing: 0.1em; color: #aaa; }
+    button {
+      padding: 12px 32px; background: #1a1a2e; border: 1px solid #555;
+      color: #eee; font-family: monospace; font-size: 1rem; cursor: pointer;
+      border-radius: 4px;
+    }
+    button:hover { border-color: #aaa; }
+    #status { font-size: 0.85rem; color: #666; text-align: center; line-height: 1.8; }
+    #hud {
+      position: fixed; bottom: 12px; left: 12px; font-size: 0.75rem;
+      color: rgba(255,255,255,0.4); z-index: 20; pointer-events: none;
+    }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "@elata-biosciences/eeg-web": "/elata/packages/eeg-web/dist/index.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <img id="display" alt="">
+  <div id="overlay">
+    <h1>EEG Neurofeedback</h1>
+    <button id="connectBtn">Connect Muse</button>
+    <div id="status">Open ws://localhost:8765 first (run Python script)</div>
+  </div>
+  <div id="hud"></div>
+
+  <script type="module">
+    const display  = document.getElementById("display");
+    const overlay  = document.getElementById("overlay");
+    const statusEl = document.getElementById("status");
+    const hud      = document.getElementById("hud");
+    const btn      = document.getElementById("connectBtn");
+
+    function setStatus(msg) { statusEl.textContent = msg; }
+    function setHud(msg)    { hud.textContent = msg; }
+
+    // ---------- WebSocket (auto-reconnect) ----------
+    let ws = null;
+
+    function connectWs() {
+      ws = new WebSocket("ws://localhost:8765");
+
+      ws.onopen = () => setStatus("WebSocket connected — press Connect Muse");
+
+      ws.onclose = () => {
+        setStatus("WebSocket disconnected — retrying in 2s…");
+        setTimeout(connectWs, 2000);
+      };
+
+      ws.onerror = () => {};  // onclose handles it
+
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === "image") {
+          display.src = msg.data;
+          display.style.display = "block";
+          overlay.classList.add("hidden");
+        } else if (msg.type === "status") {
+          setHud(msg.text);
+        }
+      };
+    }
+
+    connectWs();
+
+    // ---------- BLE + WASM (dynamic import — failure won't break WebSocket display) ----------
+    let transport = null;
+
+    try {
+      const { initEegWasm, AthenaWasmDecoder, getEegInterleavedSamples } =
+        await import("@elata-biosciences/eeg-web");
+      const { BleTransport } =
+        await import("/elata/packages/eeg-web-ble/dist/index.js");
+
+      await initEegWasm("/elata/packages/eeg-web/wasm/eeg_wasm_bg.wasm");
+      setStatus("WASM ready — press Connect Muse");
+
+      transport = new BleTransport({
+        deviceOptions: { athenaDecoderFactory: () => new AthenaWasmDecoder() },
+      });
+
+      transport.onFrame = (frame) => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const { channelCount } = frame.eeg;
+        const interleaved = getEegInterleavedSamples(frame);
+        const nSamples = interleaved.length / channelCount;
+        const samples = [];
+        for (let i = 0; i < nSamples; i++) {
+          samples.push(
+            Array.from(interleaved.subarray(i * channelCount, (i + 1) * channelCount))
+          );
+        }
+        ws.send(JSON.stringify({ type: "eeg_frame", samples }));
+      };
+
+      transport.onStatus = (s) => {
+        setStatus(`Muse: ${s.state}${s.reason ? " — " + s.reason : ""}`);
+      };
+    } catch (e) {
+      console.warn("BLE/WASM unavailable (mock-eeg mode OK):", e);
+      btn.textContent = "BLE unavailable";
+      btn.disabled = true;
+    }
+
+    btn.onclick = async () => {
+      if (!transport) return;
+      btn.disabled = true;
+      btn.textContent = "Connecting…";
+      try {
+        await transport.startStreaming();
+        btn.textContent = "Streaming";
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = "Connect Muse";
+        setStatus(`BLE error: ${err.message}`);
+      }
+    };
+  </script>
+</body>
+</html>
