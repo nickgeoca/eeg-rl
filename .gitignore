@@ -11,3 +11,7 @@ __pycache__/
 
 # secrets
 token
+.env
+
+# model / session artifacts
+*.pt
