@@ -1,7 +1,11 @@
 default:
     just --list
 
-# Online RL training loop with real Muse 2 EEG via browser bridge
+# Start synthetic Muse BLE bridge (run in a separate terminal, then open bridge.html)
+sim:
+    cargo run --manifest-path ../elata-bio-sdk/Cargo.toml -p elata-dev-synthetic-ble-bridge
+
+# Online RL training loop (connect real Muse or run `just sim` first)
 train *args="":
     python eeg_rl_clip.py --bridge {{args}}
 
@@ -9,25 +13,9 @@ train *args="":
 run *args="":
     python eeg_rl_clip.py --bridge --inference-only {{args}}
 
-# Train with mock EEG (2D mood/energy coords)
-train-mock:
-    python eeg_rl_clip.py --mock-eeg
-
-# Train with REVE-base EEG encoder (69.2M) + mock EEG
-train-reve:
-    python eeg_rl_clip.py --mock-eeg --reve
-
-# Train with mock EEG, fullscreen display
-train-fs:
-    python eeg_rl_clip.py --mock-eeg --fullscreen
-
-# Train with REVE + mock EEG, fullscreen
-train-reve-fs:
-    python eeg_rl_clip.py --mock-eeg --reve --fullscreen
-
 # Train without dreaming (pure online REINFORCE)
 train-nodyna:
-    python eeg_rl_clip.py --mock-eeg --no-dyna
+    python eeg_rl_clip.py --bridge --no-dyna
 
 # Bake base Gemma embedding (run once before training)
 bake:
