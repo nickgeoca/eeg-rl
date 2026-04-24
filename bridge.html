@@ -3,10 +3,16 @@
 <head>
   <meta charset="utf-8">
   <title>EEG Neurofeedback</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { background: #000; color: #eee; font-family: monospace; overflow: hidden; }
-    #display { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; display: none; }
+
+    #display {
+      position: fixed; inset: 0; width: 100%; height: 100%;
+      object-fit: contain; display: none; cursor: pointer;
+    }
+
     #overlay {
       position: fixed; inset: 0; display: flex; flex-direction: column;
       align-items: center; justify-content: center; gap: 16px; z-index: 10;
@@ -21,9 +27,38 @@
     }
     button:hover { border-color: #aaa; }
     #status { font-size: 0.85rem; color: #666; text-align: center; line-height: 1.8; }
+
+    /* debug panel */
+    #debug-panel {
+      position: fixed; inset: 0; background: #050505;
+      display: none; flex-direction: column;
+      padding: 48px 28px 20px; gap: 16px; overflow: hidden;
+    }
+    #debug-panel.visible { display: flex; }
+    .chart-block { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+    .chart-title {
+      font-size: 0.65rem; color: #444; letter-spacing: 0.14em;
+      margin-bottom: 6px; text-transform: uppercase;
+    }
+    .chart-wrap { flex: 1; min-height: 0; position: relative; }
+
+    /* bug toggle button */
+    #bug-btn {
+      position: fixed; top: 12px; right: 14px; z-index: 50;
+      background: none; border: none; font-size: 1.3rem;
+      cursor: pointer; opacity: 0.35; padding: 4px;
+      line-height: 1; border-radius: 4px;
+      transition: opacity 0.15s;
+    }
+    #bug-btn:hover { opacity: 0.9; background: rgba(255,255,255,0.07); }
+
     #hud {
       position: fixed; bottom: 12px; left: 12px; font-size: 0.75rem;
       color: rgba(255,255,255,0.4); z-index: 20; pointer-events: none;
+    }
+    #click-hint {
+      position: fixed; bottom: 12px; right: 14px; font-size: 0.65rem;
+      color: rgba(255,255,255,0.2); z-index: 20; pointer-events: none;
     }
   </style>
   <script type="importmap">
@@ -36,53 +71,176 @@
 </head>
 <body>
   <img id="display" alt="">
+
   <div id="overlay">
     <h1>EEG Neurofeedback</h1>
     <button id="connectBtn">Connect Muse</button>
     <div id="status">Open ws://localhost:8765 first (run Python script)</div>
   </div>
+
+  <div id="debug-panel">
+    <div class="chart-block">
+      <div class="chart-title">EEG State</div>
+      <div class="chart-wrap"><canvas id="chart-state"></canvas></div>
+    </div>
+    <div class="chart-block">
+      <div class="chart-title">Reward / Loss</div>
+      <div class="chart-wrap"><canvas id="chart-rl"></canvas></div>
+    </div>
+  </div>
+
+  <button id="bug-btn" title="toggle debug view">🐛</button>
   <div id="hud"></div>
+  <div id="click-hint"></div>
 
   <script type="module">
-    const display  = document.getElementById("display");
-    const overlay  = document.getElementById("overlay");
-    const statusEl = document.getElementById("status");
-    const hud      = document.getElementById("hud");
-    const btn      = document.getElementById("connectBtn");
+    const display    = document.getElementById("display");
+    const overlay    = document.getElementById("overlay");
+    const statusEl   = document.getElementById("status");
+    const hud        = document.getElementById("hud");
+    const hint       = document.getElementById("click-hint");
+    const debugPanel = document.getElementById("debug-panel");
+    const bugBtn     = document.getElementById("bug-btn");
+    const btn        = document.getElementById("connectBtn");
 
     function setStatus(msg) { statusEl.textContent = msg; }
     function setHud(msg)    { hud.textContent = msg; }
+
+    // ---------- View toggle ----------
+    let showingDebug = false;
+
+    function showDebug() {
+      showingDebug = true;
+      display.style.display = "none";
+      debugPanel.classList.add("visible");
+      hint.textContent = "🐛 click image to hide";
+    }
+
+    function showImage() {
+      showingDebug = false;
+      debugPanel.classList.remove("visible");
+      display.style.display = "block";
+      hint.textContent = "🐛 click for debug";
+    }
+
+    function toggle() {
+      if (showingDebug) showImage(); else showDebug();
+    }
+
+    bugBtn.addEventListener("click", toggle);
+    display.addEventListener("click", toggle);
+
+    // ---------- Charts ----------
+    const MAX_PTS = 80;
+    const COORD_COLORS = ["#4fc3f7","#81c784","#ffb74d","#f06292","#ce93d8","#80cbc4","#fff176","#ffab91"];
+
+    const BASE_OPTS = {
+      animation: false,
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { color: "#777", font: { family: "monospace", size: 11 }, boxWidth: 12 } }
+      },
+      scales: {
+        x: { ticks: { color: "#444", font: { family: "monospace", size: 9 }, maxTicksLimit: 8 },
+             grid: { color: "#111" } },
+        y: { ticks: { color: "#444", font: { family: "monospace", size: 9 } },
+             grid: { color: "#111" } }
+      }
+    };
+
+    function makeDs(label, color) {
+      return { label, data: [], borderColor: color, borderWidth: 1.5,
+               pointRadius: 0, tension: 0.3, fill: false };
+    }
+
+    const stateData = { labels: [], datasets: [] };
+    const rlData = {
+      labels: [],
+      datasets: [
+        makeDs("reward",     "#81c784"),
+        makeDs("wm loss",    "#ef9a9a"),
+        makeDs("actor loss", "#ffb74d"),
+        makeDs("q loss",     "#ce93d8"),
+      ],
+    };
+
+    const chartState = new Chart(document.getElementById("chart-state"), {
+      type: "line", data: stateData, options: BASE_OPTS,
+    });
+    const chartRL = new Chart(document.getElementById("chart-rl"), {
+      type: "line", data: rlData, options: BASE_OPTS,
+    });
+
+    let coordInited = false;
+
+    function onMetrics(msg) {
+      const { step, coord, reward, wm_loss, actor_loss, q_loss } = msg;
+
+      // Build coord datasets on first message
+      if (!coordInited) {
+        coordInited = true;
+        const labels = coord.length === 2
+          ? ["mood", "energy"]
+          : coord.map((_, i) => `dim${i}`);
+        stateData.datasets = labels.map((lbl, i) => makeDs(lbl, COORD_COLORS[i]));
+        chartState.update("none");
+      }
+
+      // Push coord
+      stateData.labels.push(step);
+      coord.forEach((v, i) => { if (stateData.datasets[i]) stateData.datasets[i].data.push(v); });
+      if (stateData.labels.length > MAX_PTS) {
+        stateData.labels.shift();
+        stateData.datasets.forEach(ds => ds.data.shift());
+      }
+
+      // Push RL metrics (null renders as gap)
+      rlData.labels.push(step);
+      rlData.datasets[0].data.push(reward);
+      rlData.datasets[1].data.push(wm_loss);
+      rlData.datasets[2].data.push(actor_loss ?? null);
+      rlData.datasets[3].data.push(q_loss ?? null);
+      if (rlData.labels.length > MAX_PTS) {
+        rlData.labels.shift();
+        rlData.datasets.forEach(ds => ds.data.shift());
+      }
+
+      chartState.update("none");
+      chartRL.update("none");
+    }
 
     // ---------- WebSocket (auto-reconnect) ----------
     let ws = null;
 
     function connectWs() {
       ws = new WebSocket("ws://localhost:8765");
-
       ws.onopen = () => setStatus("WebSocket connected — press Connect Muse");
-
       ws.onclose = () => {
         setStatus("WebSocket disconnected — retrying in 2s…");
         setTimeout(connectWs, 2000);
       };
-
-      ws.onerror = () => {};  // onclose handles it
-
+      ws.onerror = () => {};
       ws.onmessage = (e) => {
         const msg = JSON.parse(e.data);
         if (msg.type === "image") {
           display.src = msg.data;
-          display.style.display = "block";
+          if (!showingDebug) {
+            display.style.display = "block";
+            hint.textContent = "🐛 click for debug";
+          }
           overlay.classList.add("hidden");
         } else if (msg.type === "status") {
           setHud(msg.text);
+        } else if (msg.type === "metrics") {
+          onMetrics(msg);
         }
       };
     }
 
     connectWs();
 
-    // ---------- BLE + WASM (dynamic import — failure won't break WebSocket display) ----------
+    // ---------- BLE + WASM ----------
     let transport = null;
 
     try {

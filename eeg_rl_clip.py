@@ -193,6 +193,27 @@ class MuseBridge:
             return
         self._broadcast(json.dumps({"type": "status", "text": text}))
 
+    def send_metrics(
+        self,
+        step: int,
+        coord: "np.ndarray",
+        reward: float,
+        wm_loss: float,
+        actor_loss: "float | None",
+        q_loss: "float | None",
+    ) -> None:
+        if not self._connections or self._loop is None:
+            return
+        self._broadcast(json.dumps({
+            "type": "metrics",
+            "step": step,
+            "reward": round(float(reward), 4),
+            "wm_loss": round(float(wm_loss), 4),
+            "actor_loss": round(float(actor_loss), 4) if actor_loss is not None else None,
+            "q_loss": round(float(q_loss), 4) if q_loss is not None else None,
+            "coord": coord.tolist()[:8],
+        }))
+
     def _broadcast(self, msg: str) -> None:
         for ws in list(self._connections):
             asyncio.run_coroutine_threadsafe(ws.send(msg), self._loop)
@@ -595,6 +616,8 @@ def update_sac(
     for p, pt in zip(q2.parameters(), q2_tgt.parameters()):
         pt.data.mul_(1 - SAC_TAU).add_(SAC_TAU * p.data)
 
+    return actor_loss.item(), q_loss.item()
+
 
 def dyna_sac_update(
     actor: Actor,
@@ -847,11 +870,12 @@ def run(
         wm_loss = update_world_model(wm, wm_opt, replay)
 
         # --- 10. SAC policy update (once past exploration and buffer is ready) ---
+        actor_loss, q_loss = None, None
         if step >= explore_steps and len(replay) >= BATCH_SIZE:
             coords_b, deltas_b, rewards_b, next_coords_b, goals_b = replay.sample(BATCH_SIZE)
             obs_b      = torch.cat([coords_b, goals_b],      dim=-1)
             next_obs_b = torch.cat([next_coords_b, goals_b], dim=-1)
-            update_sac(
+            actor_loss, q_loss = update_sac(
                 actor, q1, q2, q1_tgt, q2_tgt, log_alpha,
                 actor_opt, q_opt, alpha_opt,
                 obs_b, deltas_b, rewards_b, next_obs_b,
@@ -861,6 +885,9 @@ def run(
                     actor, q1, q2, q1_tgt, q2_tgt, log_alpha,
                     wm, actor_opt, q_opt, alpha_opt, replay,
                 )
+
+        if bridge:
+            bridge.send_metrics(step, coord, reward, wm_loss, actor_loss, q_loss)
 
         step += 1
 
