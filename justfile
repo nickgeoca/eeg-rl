@@ -5,9 +5,9 @@ default:
 train *args="":
     python eeg_rl_clip.py --bridge {{args}}
 
-# Inference only — run a saved policy without updating weights (TODO: wire --inference-only flag)
+# Inference only — run a saved policy without updating weights
 run *args="":
-    python eeg_rl_clip.py --bridge --no-dyna {{args}}
+    python eeg_rl_clip.py --bridge --inference-only {{args}}
 
 # Train with mock EEG (2D mood/energy coords)
 train-mock:

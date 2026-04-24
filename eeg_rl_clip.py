@@ -742,16 +742,17 @@ def run(
     dyna: bool = True,
     fullscreen: bool = False,
     bridge: "MuseBridge | None" = None,
+    inference_only: bool = False,
 ):
     """
-    explore_steps: number of random-action steps before SAC policy takes over.
-    mock_eeg:      use synthetic sine-wave EEG instead of real hardware.
-    use_reve:      encode raw EEG through REVE-base instead of (mood, energy) coords.
-    save_path:     checkpoint file for session persistence; None disables saving.
-    save_interval: save checkpoint every N steps.
-    dyna:          whether to use world-model dreaming between real steps.
-    fullscreen:    display images fullscreen via pygame instead of image.show().
-    During exploration the world model accumulates data before SAC training begins.
+    explore_steps:  number of random-action steps before SAC policy takes over.
+    mock_eeg:       use synthetic sine-wave EEG instead of real hardware.
+    use_reve:       encode raw EEG through REVE-base instead of (mood, energy) coords.
+    save_path:      checkpoint file for session persistence; None disables saving.
+    save_interval:  save checkpoint every N steps.
+    dyna:           whether to use world-model dreaming between real steps.
+    fullscreen:     display images fullscreen via pygame instead of image.show().
+    inference_only: freeze all weights — skip replay, world-model, and SAC updates.
     """
     print(f"Device: {DEVICE}")
     if mock_eeg:
@@ -795,6 +796,11 @@ def run(
     if save_path and Path(save_path).exists():
         step = load_session(save_path, actor, projector, wm, q1, q2, q1_tgt, q2_tgt, log_alpha)
 
+    if inference_only:
+        actor.eval()
+        projector.eval()
+        print("Inference-only mode: weights frozen, no replay or gradient updates.")
+
     # Sample initial goal near the user's current EEG state
     first_coord = eeg.read()
     goal_radius = GOAL_RADIUS_INIT
@@ -831,7 +837,7 @@ def run(
             np.concatenate([coord, goal]), dtype=torch.float32, device=DEVICE
         ).unsqueeze(0)  # (1, coord_dim * 2)
 
-        if step < explore_steps:
+        if not inference_only and step < explore_steps:
             # Random exploration: scale down to 0.3 so images stay visually coherent
             delta_t = (torch.rand(1, DELTA_DIM, device=DEVICE) * 2 - 1) * 0.3
             print(f"  [explore {step+1}/{explore_steps}]", end="")
@@ -872,38 +878,39 @@ def run(
                 f"step={step}  reward={reward:.3f}  |coord|={np.linalg.norm(coord):.2f}"
             )
 
-        # --- 8. Store transition ---
-        delta_np = delta_t.squeeze(0).cpu().detach().numpy()
-        replay.push(coord, delta_np, reward, next_coord, goal)
+        if not inference_only:
+            # --- 8. Store transition ---
+            delta_np = delta_t.squeeze(0).cpu().detach().numpy()
+            replay.push(coord, delta_np, reward, next_coord, goal)
 
-        # --- 9. Update world model ---
-        wm_loss = update_world_model(wm, wm_opt, replay)
+            # --- 9. Update world model ---
+            wm_loss = update_world_model(wm, wm_opt, replay)
 
-        # --- 10. SAC policy update (once past exploration and buffer is ready) ---
-        actor_loss, q_loss = None, None
-        if step >= explore_steps and len(replay) >= BATCH_SIZE:
-            coords_b, deltas_b, rewards_b, next_coords_b, goals_b = replay.sample(BATCH_SIZE)
-            obs_b      = torch.cat([coords_b, goals_b],      dim=-1)
-            next_obs_b = torch.cat([next_coords_b, goals_b], dim=-1)
-            actor_loss, q_loss = update_sac(
-                actor, q1, q2, q1_tgt, q2_tgt, log_alpha,
-                actor_opt, q_opt, alpha_opt,
-                obs_b, deltas_b, rewards_b, next_obs_b,
-            )
-            if dyna:
-                dyna_sac_update(
+            # --- 10. SAC policy update (once past exploration and buffer is ready) ---
+            actor_loss, q_loss = None, None
+            if step >= explore_steps and len(replay) >= BATCH_SIZE:
+                coords_b, deltas_b, rewards_b, next_coords_b, goals_b = replay.sample(BATCH_SIZE)
+                obs_b      = torch.cat([coords_b, goals_b],      dim=-1)
+                next_obs_b = torch.cat([next_coords_b, goals_b], dim=-1)
+                actor_loss, q_loss = update_sac(
                     actor, q1, q2, q1_tgt, q2_tgt, log_alpha,
-                    wm, actor_opt, q_opt, alpha_opt, replay,
+                    actor_opt, q_opt, alpha_opt,
+                    obs_b, deltas_b, rewards_b, next_obs_b,
                 )
+                if dyna:
+                    dyna_sac_update(
+                        actor, q1, q2, q1_tgt, q2_tgt, log_alpha,
+                        wm, actor_opt, q_opt, alpha_opt, replay,
+                    )
 
-        if bridge:
-            bridge.send_metrics(step, coord, reward, wm_loss, actor_loss, q_loss)
+            if bridge:
+                bridge.send_metrics(step, coord, reward, wm_loss, actor_loss, q_loss)
+
+            # --- 11. Periodic checkpoint ---
+            if save_path and step % save_interval == 0:
+                save_session(save_path, actor, projector, wm, q1, q2, q1_tgt, q2_tgt, log_alpha, step)
 
         step += 1
-
-        # --- 11. Periodic checkpoint ---
-        if save_path and step % save_interval == 0:
-            save_session(save_path, actor, projector, wm, q1, q2, q1_tgt, q2_tgt, log_alpha, step)
 
 
 
@@ -934,6 +941,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Use browser bridge: serves bridge.html + receives Muse 2 EEG via WebSocket.")
     p.add_argument("--ws-port",   type=int, default=8765, help="WebSocket port (default: 8765).")
     p.add_argument("--http-port", type=int, default=8080, help="HTTP server port (default: 8080).")
+    p.add_argument("--inference-only", action="store_true", default=False,
+                   help="Freeze weights: skip replay, world-model, and SAC updates.")
     return p.parse_args()
 
 
@@ -949,4 +958,5 @@ if __name__ == "__main__":
         dyna=not args.no_dyna,
         fullscreen=args.fullscreen,
         bridge=bridge,
+        inference_only=args.inference_only,
     )
