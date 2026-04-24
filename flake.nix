@@ -20,7 +20,7 @@
     {
       devShells.${system}.default = pkgs.mkShell {
         buildInputs = with pkgs; [
-          python3 uv just
+          python3 uv just cargo rustc
           cudaPackages.cudatoolkit
           cudaPackages.cuda_cudart
         ];
