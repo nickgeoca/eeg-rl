@@ -35,7 +35,7 @@ with torch.no_grad():
         max_length=SEQ_LEN,
         truncation=True,
     ).to(DEVICE)
-    base_emb = pipe.text_encoder(**tokens).last_hidden_state  # (1, SEQ_LEN, 2048)
+    base_emb = pipe.text_encoder(**tokens).last_hidden_state  # (1, SEQ_LEN, 2304)
 
 print(f"Embedding shape: {base_emb.shape}  dtype: {base_emb.dtype}")
 torch.save(base_emb.cpu(), OUTPUT_PATH)
