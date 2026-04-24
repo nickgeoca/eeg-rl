@@ -6,12 +6,28 @@ sim:
     cargo run --manifest-path ../elata-bio-sdk/Cargo.toml -p elata-dev-synthetic-ble-bridge
 
 # Online RL training loop (connect real Muse or run `just sim` first)
-train *args="":
-    python eeg_rl_clip.py --bridge {{args}}
+train:
+    #!/usr/bin/env bash
+    echo "EEG embedding:"
+    echo "  1) Band powers — 2D mood/energy (fast, interpretable)"
+    echo "  2) REVE-base   — 69.2M encoder (richer, slower)"
+    read -rp "Choice [1]: " choice
+    case "${choice:-1}" in
+        2) python eeg_rl_clip.py --bridge --reve ;;
+        *) python eeg_rl_clip.py --bridge ;;
+    esac
 
 # Inference only — run a saved policy without updating weights
-run *args="":
-    python eeg_rl_clip.py --bridge --inference-only {{args}}
+run:
+    #!/usr/bin/env bash
+    echo "EEG embedding:"
+    echo "  1) Band powers — 2D mood/energy (fast, interpretable)"
+    echo "  2) REVE-base   — 69.2M encoder (richer, slower)"
+    read -rp "Choice [1]: " choice
+    case "${choice:-1}" in
+        2) python eeg_rl_clip.py --bridge --reve --inference-only ;;
+        *) python eeg_rl_clip.py --bridge --inference-only ;;
+    esac
 
 # Train without dreaming (pure online REINFORCE)
 train-nodyna:
