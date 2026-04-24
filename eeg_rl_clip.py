@@ -27,14 +27,24 @@ Stubs are marked with: # STUB
 """
 
 import argparse
+import asyncio
+import base64
+import json
+import mimetypes
+import os
 import signal
+import threading
 import time
 from collections import deque
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+from io import BytesIO
 
 import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
+
+mimetypes.add_type("application/wasm", ".wasm")
 
 # ---------------------------------------------------------------------------
 # Config
@@ -43,10 +53,9 @@ from PIL import Image
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 DELTA_DIM    = 16     # RL action dimensionality (low-dim latent delta)
-GEMMA_DIM    = 2048   # Gemma2-2B hidden size (SANA-Sprint's text encoder dim)
+GEMMA_DIM    = 2304   # Gemma2-2B hidden size (SANA-Sprint's text encoder dim)
 SEQ_LEN      = 77     # token sequence length fed to the model (can go up to 300)
-COORD_DIM    = 2      # (mood, energy)
-POLICY_INPUT = COORD_DIM * 2  # (current_mood, current_energy, goal_mood, goal_energy)
+COORD_DIM    = 2      # (mood, energy) — overridden at runtime when --reve is used
 
 STEP_SECONDS   = 10    # seconds to show each image before reading EEG again
 GOAL_INTERVAL  = 30    # seconds before sampling a new random goal
@@ -57,6 +66,130 @@ LR             = 3e-4
 
 BASE_PROMPT    = "abstract generative art, neutral"  # used only in bake_base_embedding.py
 BASE_EMB_PATH  = "base_emb.pt"                       # pre-computed embedding, loaded at runtime
+
+# ---------------------------------------------------------------------------
+# Browser bridge — HTTP + WebSocket servers
+# ---------------------------------------------------------------------------
+
+_SDK_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../elata-bio-sdk"))
+
+
+class _BridgeHTTPHandler(SimpleHTTPRequestHandler):
+    """Serves bridge.html from the project dir; /elata/* maps to the SDK."""
+
+    def translate_path(self, path):
+        if path.startswith("/elata/"):
+            return os.path.join(_SDK_ROOT, path[len("/elata/"):].lstrip("/"))
+        return super().translate_path(path)
+
+    def log_message(self, *args):
+        pass
+
+    def handle_error(self, request, client_address):
+        import errno, sys
+        exc = sys.exc_info()[1]
+        if isinstance(exc, BrokenPipeError) or (isinstance(exc, OSError) and exc.errno == errno.ECONNRESET):
+            return
+        super().handle_error(request, client_address)
+
+
+class MuseBridge:
+    """
+    HTTP + WebSocket bridge between the Muse 2 browser page and Python.
+
+    Background threads run an HTTP server (serves bridge.html + elata SDK)
+    and a WebSocket server (receives EEG frames, sends images).
+
+    Thread-safe API for the main loop:
+        get_window()      → np.ndarray (4, 400) at 200 Hz — blocks until 2 s ready
+        send_image(img)   → streams PIL Image to browser as JPEG
+        send_status(text) → updates the HUD overlay in the browser
+    """
+
+    CHANNELS   = ["TP9", "AF7", "AF8", "TP10"]
+    _IN_HZ     = 256
+    _WINDOW_IN = int(2.0 * _IN_HZ)  # 512 samples = 2 s at 256 Hz
+
+    def __init__(self, ws_port: int = 8765, http_port: int = 8080):
+        self._ws_port   = ws_port
+        self._http_port = http_port
+        self._buf: deque = deque(maxlen=self._WINDOW_IN * 4)
+        self._buf_lock   = threading.Lock()
+        self._data_ready = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._connections: set = set()
+        self._started = threading.Event()
+
+        threading.Thread(target=self._run_http, daemon=True).start()
+        threading.Thread(target=self._run_ws,   daemon=True).start()
+        self._started.wait()
+        print(f"  Bridge ready → open http://localhost:{http_port}/bridge.html in Chrome")
+
+    # ------------------------------------------------------------------
+    # Background threads
+    # ------------------------------------------------------------------
+
+    def _run_http(self):
+        server = HTTPServer(("localhost", self._http_port), _BridgeHTTPHandler)
+        server.serve_forever()
+
+    def _run_ws(self):
+        import websockets
+
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+
+        async def _serve():
+            async with websockets.serve(self._handler, "localhost", self._ws_port):
+                self._started.set()
+                await asyncio.Future()
+
+        self._loop.run_until_complete(_serve())
+
+    async def _handler(self, ws):
+        self._connections.add(ws)
+        try:
+            async for raw in ws:
+                msg = json.loads(raw)
+                if msg.get("type") == "eeg_frame":
+                    samples = msg["samples"]  # [[tp9,af7,af8,tp10], …]
+                    with self._buf_lock:
+                        self._buf.extend(samples)
+                        if len(self._buf) >= self._WINDOW_IN:
+                            self._data_ready.set()
+        finally:
+            self._connections.discard(ws)
+
+    # ------------------------------------------------------------------
+    # Main-thread API
+    # ------------------------------------------------------------------
+
+    def get_window(self, timeout: float = 60.0) -> np.ndarray:
+        """Return the latest 2 s EEG window resampled to 200 Hz. Shape: (4, 400)."""
+        from reve import resample_to_200hz
+        if not self._data_ready.wait(timeout=timeout):
+            raise TimeoutError("No EEG data received from browser within timeout")
+        with self._buf_lock:
+            tail = list(self._buf)[-self._WINDOW_IN:]
+        arr = np.array(tail, dtype=np.float32).T  # (4, 512)
+        return resample_to_200hz(arr)              # (4, 400)
+
+    def send_image(self, img: "Image.Image") -> None:
+        if not self._connections or self._loop is None:
+            return
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        data = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+        self._broadcast(json.dumps({"type": "image", "data": data}))
+
+    def send_status(self, text: str) -> None:
+        if not self._connections or self._loop is None:
+            return
+        self._broadcast(json.dumps({"type": "status", "text": text}))
+
+    def _broadcast(self, msg: str) -> None:
+        for ws in list(self._connections):
+            asyncio.run_coroutine_threadsafe(ws.send(msg), self._loop)
 
 GOAL_RADIUS_INIT = 0.3   # initial goal sampling radius around current EEG state
 GOAL_RADIUS_MAX  = 1.0   # maximum radius (expanded after each resample)
@@ -107,37 +240,93 @@ class EEGSource:
                 "Real EEG not connected. Run with --mock-eeg for smoke testing."
             )
 
-    def read(self) -> tuple[float, float]:
-        """Return instantaneous (mood, energy) from hardware or mock."""
+    def read(self) -> np.ndarray:
+        """Return instantaneous (mood, energy) as a 1-D float32 array."""
         if self.mock:
             return self._mock_read()
         # STUB: replace with actual Elata SDK call, e.g.:
         #   state = self._elata.get_state()
-        #   return float(state.mood), float(state.energy)
+        #   return np.array([state.mood, state.energy], dtype=np.float32)
         raise NotImplementedError("Connect Elata SDK here")
 
-    def _mock_read(self) -> tuple[float, float]:
-        """
-        Synthetic EEG: slow sine-wave drift with small Gaussian noise.
-        Period is long enough that 10 s steps see meaningful change.
-        """
+    def _mock_read(self) -> np.ndarray:
         t = time.time() - self._t0
         mood   = 0.6 * np.sin(2 * np.pi * t / 60.0) + 0.1 * np.random.randn()
         energy = 0.5 * np.cos(2 * np.pi * t / 90.0) + 0.1 * np.random.randn()
-        return float(np.clip(mood, -1, 1)), float(np.clip(energy, -1, 1))
+        return np.array([np.clip(mood, -1, 1), np.clip(energy, -1, 1)], dtype=np.float32)
 
-    def smooth(self) -> tuple[float, float]:
-        """
-        EMA-smoothed reading over the history window.
-        Calls read() internally; most-recent sample has highest weight.
-        """
+    def smooth(self) -> np.ndarray:
         self._history.append(self.read())
         n       = len(self._history)
-        moods   = [h[0] for h in self._history]
-        energies= [h[1] for h in self._history]
+        stack   = np.stack(list(self._history))         # (n, coord_dim)
         weights = np.array([0.5 ** (n - 1 - i) for i in range(n)])
         weights /= weights.sum()
-        return float(np.dot(weights, moods)), float(np.dot(weights, energies))
+        return (weights[:, None] * stack).sum(axis=0).astype(np.float32)
+
+    @property
+    def coord_dim(self) -> int:
+        return 2
+
+
+class REVEEEGSource:
+    """
+    EEG source that encodes raw signals through REVE-base (69.2M) and returns
+    a mean-pooled flat embedding as the state coordinate.
+
+    The coord_dim is determined on the first read() call (lazy REVE load).
+    Pass a MuseBridge instance for real hardware; pass mock=True for smoke testing.
+    """
+
+    def __init__(
+        self,
+        mock: bool = False,
+        smooth_window: int = 3,
+        bridge: "MuseBridge | None" = None,
+    ):
+        from reve import REVEEncoder, DEFAULT_ELECTRODES, MUSE_CHANNELS, SAMPLE_RATE
+        self._bridge     = bridge
+        self._mock       = mock
+        self._electrodes = MUSE_CHANNELS if bridge else DEFAULT_ELECTRODES
+        self._encoder    = REVEEncoder(electrode_names=self._electrodes)
+        self._sample_rate = SAMPLE_RATE
+        self._history: deque = deque(maxlen=smooth_window)
+        self._coord_dim: int | None = None
+
+        if not mock and bridge is None:
+            raise NotImplementedError(
+                "Provide a MuseBridge (--bridge) or use --mock-eeg for smoke testing."
+            )
+
+    def _raw_eeg(self) -> np.ndarray:
+        """Return (channels, time_points) float32 array at 200 Hz."""
+        if self._mock:
+            n_ch = len(self._electrodes)
+            n_t  = int(2.0 * self._sample_rate)
+            return np.random.randn(n_ch, n_t).astype(np.float32)
+        return self._bridge.get_window()  # (4, 400) at 200 Hz
+
+    def read(self) -> np.ndarray:
+        """Encode one EEG segment and return mean-pooled flat vector."""
+        eeg = self._raw_eeg()
+        emb = self._encoder.encode(eeg)             # (1, tokens, hidden)
+        flat = emb.squeeze(0).mean(0).cpu().numpy() # (hidden,)
+        self._coord_dim = flat.shape[0]
+        return flat.astype(np.float32)
+
+    def smooth(self) -> np.ndarray:
+        self._history.append(self.read())
+        n       = len(self._history)
+        stack   = np.stack(list(self._history))
+        weights = np.array([0.5 ** (n - 1 - i) for i in range(n)])
+        weights /= weights.sum()
+        return (weights[:, None] * stack).sum(axis=0).astype(np.float32)
+
+    @property
+    def coord_dim(self) -> int:
+        if self._coord_dim is None:
+            # probe to determine output dim before the main loop
+            self.read()
+        return self._coord_dim
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +343,7 @@ class ImageGenerator:
             "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
             torch_dtype=torch.bfloat16,
         ).to(DEVICE)
+        self.pipe.vae.enable_tiling(tile_sample_min_width=512, tile_sample_min_height=512)
         # Uncomment to offload heavy blocks to CPU between steps (saves VRAM):
         # self.pipe.enable_model_cpu_offload()
         print("Pipeline ready.")
@@ -165,8 +355,10 @@ class ImageGenerator:
         prompt_embeds: shape (1, SEQ_LEN, GEMMA_DIM)
         Returns: PIL Image
         """
+        attn_mask = torch.ones(prompt_embeds.shape[:2], dtype=torch.long, device=prompt_embeds.device)
         return self.pipe(
             prompt_embeds=prompt_embeds.to(torch.bfloat16),
+            prompt_attention_mask=attn_mask,
             num_inference_steps=2,   # one-step model; 1-2 steps is sufficient
             guidance_scale=4.5,
         ).images[0]
@@ -178,16 +370,15 @@ class ImageGenerator:
 
 class Policy(nn.Module):
     """
-    Input:  (cur_mood, cur_energy, goal_mood, goal_energy)  — 4 floats
+    Input:  (current_coord, goal_coord) concatenated — coord_dim * 2 floats
     Output: delta vector in low-dim space (DELTA_DIM floats, then projected to GEMMA_DIM)
-    Uses tanh output so delta lives in [-1, 1] before norm clipping.
     """
-    def __init__(self):
+    def __init__(self, coord_dim: int = COORD_DIM):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(POLICY_INPUT, 64), nn.ReLU(),
-            nn.Linear(64, 64),           nn.ReLU(),
-            nn.Linear(64, DELTA_DIM),    nn.Tanh(),
+            nn.Linear(coord_dim * 2, 64), nn.ReLU(),
+            nn.Linear(64, 64),            nn.ReLU(),
+            nn.Linear(64, DELTA_DIM),     nn.Tanh(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -211,16 +402,16 @@ class DeltaProjector(nn.Module):
 
 class WorldModel(nn.Module):
     """
-    Predicts next (mood, energy) given current (mood, energy) and delta action.
-    Input:  (mood, energy, delta...)  — COORD_DIM + DELTA_DIM
-    Output: (next_mood, next_energy)  — COORD_DIM
+    Predicts next coord given current coord and delta action.
+    Input:  (coord, delta)  — coord_dim + DELTA_DIM
+    Output: next_coord      — coord_dim
     """
-    def __init__(self):
+    def __init__(self, coord_dim: int = COORD_DIM):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(COORD_DIM + DELTA_DIM, 64), nn.ReLU(),
-            nn.Linear(64, 64),                     nn.ReLU(),
-            nn.Linear(64, COORD_DIM),
+            nn.Linear(coord_dim + DELTA_DIM, 64), nn.ReLU(),
+            nn.Linear(64, 64),                    nn.ReLU(),
+            nn.Linear(64, coord_dim),
         )
 
     def forward(self, coord: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
@@ -401,14 +592,17 @@ def load_session(
 def run(
     explore_steps: int = 20,
     mock_eeg: bool = False,
+    use_reve: bool = False,
     save_path: str | None = "session.pt",
     save_interval: int = 10,
     dyna: bool = True,
     fullscreen: bool = False,
+    bridge: "MuseBridge | None" = None,
 ):
     """
     explore_steps: number of random-action steps before policy takes over.
     mock_eeg:      use synthetic sine-wave EEG instead of real hardware.
+    use_reve:      encode raw EEG through REVE-base instead of (mood, energy) coords.
     save_path:     checkpoint file for session persistence; None disables saving.
     save_interval: save checkpoint every N steps.
     dyna:          whether to use world-model dreaming between real steps.
@@ -420,13 +614,22 @@ def run(
         print("Using mock EEG (sine wave). Pass mock_eeg=False for real hardware.")
 
     # Init components
-    eeg       = EEGSource(mock=mock_eeg)
+    if use_reve:
+        print("EEG encoder: REVE-base (69.2M)")
+        eeg = REVEEEGSource(mock=mock_eeg, bridge=bridge)
+    else:
+        eeg = EEGSource(mock=mock_eeg)
+
+    coord_dim = eeg.coord_dim
+    if use_reve:
+        print(f"REVE coord dim: {coord_dim}")
+
     generator = ImageGenerator()
     base_emb  = load_base_embedding()  # (1, SEQ_LEN, GEMMA_DIM), frozen, pre-computed offline
 
-    policy    = Policy().to(DEVICE)
+    policy    = Policy(coord_dim=coord_dim).to(DEVICE)
     projector = DeltaProjector().to(DEVICE)
-    wm        = WorldModel().to(DEVICE)
+    wm        = WorldModel(coord_dim=coord_dim).to(DEVICE)
     replay    = ReplayBuffer()
 
     pol_opt = torch.optim.Adam(list(policy.parameters()) + list(projector.parameters()), lr=LR)
@@ -438,7 +641,7 @@ def run(
         step = load_session(save_path, policy, projector, wm)
 
     # Sample initial goal near the user's current EEG state
-    first_coord = np.array(eeg.read(), dtype=np.float32)
+    first_coord = eeg.read()
     goal_radius = GOAL_RADIUS_INIT
     goal        = sample_goal_near(first_coord, goal_radius)
     goal_timer  = time.time()
@@ -455,24 +658,23 @@ def run(
     signal.signal(signal.SIGINT, _handle_sigint)
 
     print("Starting neurofeedback loop. Ctrl-C to stop.")
-    print(f"  First goal: mood={goal[0]:.2f}  energy={goal[1]:.2f}  radius={goal_radius:.2f}")
+    print(f"  First goal (norm={np.linalg.norm(goal):.2f})  radius={goal_radius:.2f}")
 
     while True:
         # --- 1. Read current EEG state ---
-        coord = np.array(eeg.read(), dtype=np.float32)  # (mood, energy)
+        coord = eeg.read()  # (coord_dim,)
 
         # --- 2. Refresh goal if interval elapsed ---
         if time.time() - goal_timer > GOAL_INTERVAL:
             goal_radius = min(GOAL_RADIUS_MAX, goal_radius + GOAL_RADIUS_GROW)
             goal        = sample_goal_near(coord, goal_radius)
             goal_timer  = time.time()
-            print(f"\n  New goal: mood={goal[0]:.2f}  energy={goal[1]:.2f}"
-                  f"  radius={goal_radius:.2f}")
+            print(f"\n  New goal (norm={np.linalg.norm(goal):.2f})  radius={goal_radius:.2f}")
 
         # --- 3. Choose action (delta) ---
         obs = torch.tensor(
             np.concatenate([coord, goal]), dtype=torch.float32, device=DEVICE
-        ).unsqueeze(0)  # (1, 4)
+        ).unsqueeze(0)  # (1, coord_dim * 2)
 
         if step < explore_steps:
             # Random exploration: scale down to 0.3 so images stay visually coherent
@@ -500,17 +702,25 @@ def run(
 
         # --- 5. Generate and display image ---
         image = generator.generate(final_emb.detach())
-        display_image(image, fullscreen=fullscreen)
+        if bridge:
+            bridge.send_image(image)
+        else:
+            display_image(image, fullscreen=fullscreen)
 
         # --- 6. Wait, then read new EEG state ---
         time.sleep(STEP_SECONDS)
-        next_coord = np.array(eeg.read(), dtype=np.float32)
+        next_coord = eeg.read()  # (coord_dim,)
 
         # --- 7. Compute reward: negative distance to goal ---
         reward = -float(np.linalg.norm(next_coord - goal))
-        print(f"  step={step}  coord=({coord[0]:.2f},{coord[1]:.2f})"
-              f"  next=({next_coord[0]:.2f},{next_coord[1]:.2f})"
+        print(f"  step={step}  |coord|={np.linalg.norm(coord):.2f}"
+              f"  |next|={np.linalg.norm(next_coord):.2f}"
               f"  reward={reward:.3f}")
+
+        if bridge:
+            bridge.send_status(
+                f"step={step}  reward={reward:.3f}  |coord|={np.linalg.norm(coord):.2f}"
+            )
 
         # --- 8. Store transition ---
         delta_np = delta_t.squeeze(0).cpu().detach().numpy()
@@ -544,6 +754,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Random exploration steps before policy takes over (default: 20).")
     p.add_argument("--mock-eeg", action="store_true", default=False,
                    help="Use synthetic sine-wave EEG instead of real hardware.")
+    p.add_argument("--reve", action="store_true", default=False,
+                   help="Encode raw EEG through REVE-base (69.2M) instead of (mood, energy) coords.")
     p.add_argument("--save-path", type=str, default="session.pt",
                    help="Checkpoint file for session persistence (default: session.pt).")
     p.add_argument("--no-save", action="store_true", default=False,
@@ -554,16 +766,23 @@ def _parse_args() -> argparse.Namespace:
                    help="Disable world-model dreaming (pure online REINFORCE).")
     p.add_argument("--fullscreen", action="store_true", default=False,
                    help="Display images fullscreen via pygame (requires: pip install pygame).")
+    p.add_argument("--bridge", action="store_true", default=False,
+                   help="Use browser bridge: serves bridge.html + receives Muse 2 EEG via WebSocket.")
+    p.add_argument("--ws-port",   type=int, default=8765, help="WebSocket port (default: 8765).")
+    p.add_argument("--http-port", type=int, default=8080, help="HTTP server port (default: 8080).")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
+    bridge = MuseBridge(ws_port=args.ws_port, http_port=args.http_port) if args.bridge else None
     run(
         explore_steps=args.explore_steps,
         mock_eeg=args.mock_eeg,
+        use_reve=args.reve,
         save_path=None if args.no_save else args.save_path,
         save_interval=args.save_interval,
         dyna=not args.no_dyna,
         fullscreen=args.fullscreen,
+        bridge=bridge,
     )
