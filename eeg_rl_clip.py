@@ -21,7 +21,7 @@ Pipeline per step:
   4. Feed embedding directly to SANA-Sprint (no text, no Gemma at runtime)
   5. Display image for STEP_SECONDS
   6. Read new (mood, energy), compute reward, store transition
-  7. Update world model + policy online
+  7. Update world model + SAC policy online
 
 Stubs are marked with: # STUB
 """
@@ -66,6 +66,12 @@ LR             = 3e-4
 
 BASE_PROMPT    = "abstract generative art, neutral"  # used only in bake_base_embedding.py
 BASE_EMB_PATH  = "base_emb.pt"                       # pre-computed embedding, loaded at runtime
+
+# SAC hyperparameters
+SAC_GAMMA          = 0.99              # discount factor
+SAC_TAU            = 0.005            # soft target-network update rate
+SAC_TARGET_ENTROPY = -float(DELTA_DIM) # entropy target for alpha auto-tuning
+LOG_STD_MIN, LOG_STD_MAX = -5, 2
 
 # ---------------------------------------------------------------------------
 # Browser bridge — HTTP + WebSocket servers
@@ -368,21 +374,59 @@ class ImageGenerator:
 # RL Models
 # ---------------------------------------------------------------------------
 
-class Policy(nn.Module):
+class Actor(nn.Module):
     """
-    Input:  (current_coord, goal_coord) concatenated — coord_dim * 2 floats
-    Output: delta vector in low-dim space (DELTA_DIM floats, then projected to GEMMA_DIM)
+    Stochastic actor for SAC.
+    Input:  obs = concat(coord, goal) — coord_dim * 2 floats
+    Output: tanh-squashed action in (-1, 1)^DELTA_DIM
+    """
+    def __init__(self, coord_dim: int = COORD_DIM):
+        super().__init__()
+        self.trunk = nn.Sequential(
+            nn.Linear(coord_dim * 2, 64), nn.ReLU(),
+            nn.Linear(64, 64),            nn.ReLU(),
+        )
+        self.mean_head    = nn.Linear(64, DELTA_DIM)
+        self.log_std_head = nn.Linear(64, DELTA_DIM)
+
+    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h = self.trunk(obs)
+        mean    = self.mean_head(h)
+        log_std = self.log_std_head(h).clamp(LOG_STD_MIN, LOG_STD_MAX)
+        return mean, log_std
+
+    def sample(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample action + log_prob with tanh correction. Returns (action, log_prob)."""
+        mean, log_std = self(obs)
+        std    = log_std.exp()
+        u      = torch.distributions.Normal(mean, std).rsample()  # reparameterized
+        action = torch.tanh(u)
+        log_prob = (
+            torch.distributions.Normal(mean, std).log_prob(u)
+            - torch.log(1 - action.pow(2) + 1e-6)
+        ).sum(dim=-1, keepdim=True)
+        return action, log_prob
+
+    def mean_action(self, obs: torch.Tensor) -> torch.Tensor:
+        mean, _ = self(obs)
+        return torch.tanh(mean)
+
+
+class Critic(nn.Module):
+    """
+    Q-function: Q(obs, action) → scalar.
+    obs = concat(coord, goal) — coord_dim * 2 floats
     """
     def __init__(self, coord_dim: int = COORD_DIM):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(coord_dim * 2, 64), nn.ReLU(),
-            nn.Linear(64, 64),            nn.ReLU(),
-            nn.Linear(64, DELTA_DIM),     nn.Tanh(),
+            nn.Linear(coord_dim * 2 + DELTA_DIM, 64), nn.ReLU(),
+            nn.Linear(64, 64),                         nn.ReLU(),
+            nn.Linear(64, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([obs, action], dim=-1))
 
 
 class DeltaProjector(nn.Module):
@@ -423,20 +467,29 @@ class WorldModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ReplayBuffer:
-    """Sliding window of (coord, delta, next_coord) transitions."""
+    """Sliding window of (coord, delta, reward, next_coord, goal) transitions."""
     def __init__(self, maxlen: int = REPLAY_MAXLEN):
         self.buf = deque(maxlen=maxlen)
 
-    def push(self, coord: np.ndarray, delta: np.ndarray, next_coord: np.ndarray):
-        self.buf.append((coord.copy(), delta.copy(), next_coord.copy()))
+    def push(
+        self,
+        coord: np.ndarray,
+        delta: np.ndarray,
+        reward: float,
+        next_coord: np.ndarray,
+        goal: np.ndarray,
+    ):
+        self.buf.append((coord.copy(), delta.copy(), float(reward), next_coord.copy(), goal.copy()))
 
-    def sample(self, n: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        idx = np.random.choice(len(self.buf), size=n, replace=False)
+    def sample(self, n: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        idx   = np.random.choice(len(self.buf), size=n, replace=False)
         items = [self.buf[i] for i in idx]
         coords      = torch.tensor([i[0] for i in items], dtype=torch.float32, device=DEVICE)
         deltas      = torch.tensor([i[1] for i in items], dtype=torch.float32, device=DEVICE)
-        next_coords = torch.tensor([i[2] for i in items], dtype=torch.float32, device=DEVICE)
-        return coords, deltas, next_coords
+        rewards     = torch.tensor([i[2] for i in items], dtype=torch.float32, device=DEVICE).unsqueeze(1)
+        next_coords = torch.tensor([i[3] for i in items], dtype=torch.float32, device=DEVICE)
+        goals       = torch.tensor([i[4] for i in items], dtype=torch.float32, device=DEVICE)
+        return coords, deltas, rewards, next_coords, goals
 
     def __len__(self):
         return len(self.buf)
@@ -482,7 +535,7 @@ def update_world_model(
 ) -> float:
     if len(replay) < BATCH_SIZE:
         return 0.0
-    coords, deltas, next_coords = replay.sample(BATCH_SIZE)
+    coords, deltas, _, next_coords, _ = replay.sample(BATCH_SIZE)
     pred = wm(coords, deltas)
     loss = nn.functional.mse_loss(pred, next_coords)
     opt.zero_grad()
@@ -491,59 +544,97 @@ def update_world_model(
     return loss.item()
 
 
-def update_policy_reinforce(
-    policy: Policy,
-    opt: torch.optim.Optimizer,
-    log_prob: torch.Tensor,
-    reward: float,
-):
-    """Single-step REINFORCE update."""
-    loss = -log_prob * reward
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
+def update_sac(
+    actor: Actor,
+    q1: Critic,
+    q2: Critic,
+    q1_tgt: Critic,
+    q2_tgt: Critic,
+    log_alpha: torch.Tensor,
+    actor_opt: torch.optim.Optimizer,
+    q_opt: torch.optim.Optimizer,
+    alpha_opt: torch.optim.Optimizer,
+    obs: torch.Tensor,
+    action: torch.Tensor,
+    reward: torch.Tensor,
+    next_obs: torch.Tensor,
+) -> None:
+    alpha = log_alpha.exp().detach()
+
+    # Critic update — Bellman target with entropy bonus
+    with torch.no_grad():
+        next_act, next_lp = actor.sample(next_obs)
+        q_next   = torch.min(q1_tgt(next_obs, next_act), q2_tgt(next_obs, next_act))
+        q_target = reward + SAC_GAMMA * (q_next - alpha * next_lp)
+
+    q_loss = (
+        nn.functional.mse_loss(q1(obs, action), q_target)
+        + nn.functional.mse_loss(q2(obs, action), q_target)
+    )
+    q_opt.zero_grad()
+    q_loss.backward()
+    q_opt.step()
+
+    # Actor update — maximise Q minus entropy cost
+    new_act, log_prob = actor.sample(obs)
+    q_val      = torch.min(q1(obs, new_act), q2(obs, new_act))
+    actor_loss = (alpha * log_prob - q_val).mean()
+    actor_opt.zero_grad()
+    actor_loss.backward()
+    actor_opt.step()
+
+    # Alpha update — keep entropy near target
+    alpha_loss = -(log_alpha * (log_prob.detach() + SAC_TARGET_ENTROPY)).mean()
+    alpha_opt.zero_grad()
+    alpha_loss.backward()
+    alpha_opt.step()
+
+    # Soft-update frozen target critics
+    for p, pt in zip(q1.parameters(), q1_tgt.parameters()):
+        pt.data.mul_(1 - SAC_TAU).add_(SAC_TAU * p.data)
+    for p, pt in zip(q2.parameters(), q2_tgt.parameters()):
+        pt.data.mul_(1 - SAC_TAU).add_(SAC_TAU * p.data)
 
 
-def dyna_policy_update(
-    policy: Policy,
+def dyna_sac_update(
+    actor: Actor,
+    q1: Critic,
+    q2: Critic,
+    q1_tgt: Critic,
+    q2_tgt: Critic,
+    log_alpha: torch.Tensor,
     wm: WorldModel,
-    pol_opt: torch.optim.Optimizer,
+    actor_opt: torch.optim.Optimizer,
+    q_opt: torch.optim.Optimizer,
+    alpha_opt: torch.optim.Optimizer,
     replay: ReplayBuffer,
-    goal: np.ndarray,
     n_steps: int = 5,
-):
+) -> None:
     """
-    Dyna-style: roll out n_steps imagined transitions through the world model
-    and update the policy on each. Starts from a random real coord in the
-    replay buffer; uses the world model as a cheap simulator so the policy
-    sees more transitions per unit of real time.
-
-    Does nothing if the replay buffer has fewer than BATCH_SIZE entries.
+    Dyna-style: generate n_steps imagined transitions via the world model and
+    run SAC updates on each. More data-efficient than real steps alone — the
+    critics learn faster, which lowers actor gradient variance.
     """
     if len(replay) < BATCH_SIZE or n_steps == 0:
         return
 
-    goal_t = torch.tensor(goal, dtype=torch.float32, device=DEVICE).unsqueeze(0)  # (1,2)
-    coords, _, _ = replay.sample(BATCH_SIZE)
-    coord = coords[torch.randint(len(coords), (1,))].detach()  # (1,2)
+    coords, _, _, _, goals = replay.sample(BATCH_SIZE)
+    coord  = coords[torch.randint(len(coords), (1,))].detach()
+    goal_t = goals[torch.randint(len(goals), (1,))].detach()
 
     for _ in range(n_steps):
-        obs        = torch.cat([coord, goal_t], dim=-1)        # (1,4)
-        delta_mean = policy(obs)
-        noise      = torch.randn_like(delta_mean) * 0.1
-        delta_t    = delta_mean + noise
-        dist       = torch.distributions.Normal(delta_mean, 0.1)
-        log_prob   = dist.log_prob(delta_t).sum()
-
+        obs = torch.cat([coord, goal_t], dim=-1)
         with torch.no_grad():
-            next_coord = wm(coord, delta_t).clamp(-1.0, 1.0)
+            action, _ = actor.sample(obs)
+            next_coord = wm(coord, action).clamp(-1.0, 1.0)
+        next_obs = torch.cat([next_coord, goal_t], dim=-1)
+        reward   = -torch.norm(next_coord - goal_t, dim=-1, keepdim=True)
 
-        reward = -float(torch.norm(next_coord - goal_t).item())
-        loss   = -log_prob * reward
-        pol_opt.zero_grad()
-        loss.backward()
-        pol_opt.step()
-
+        update_sac(
+            actor, q1, q2, q1_tgt, q2_tgt, log_alpha,
+            actor_opt, q_opt, alpha_opt,
+            obs, action, reward, next_obs,
+        )
         coord = next_coord.detach()
 
 
@@ -556,15 +647,25 @@ from pathlib import Path  # noqa: E402 — grouped with session helpers
 
 def save_session(
     path: str,
-    policy: Policy,
+    actor: Actor,
     projector: DeltaProjector,
     wm: WorldModel,
+    q1: Critic,
+    q2: Critic,
+    q1_tgt: Critic,
+    q2_tgt: Critic,
+    log_alpha: torch.Tensor,
     step: int,
 ):
     torch.save({
-        "policy":    policy.state_dict(),
+        "actor":     actor.state_dict(),
         "projector": projector.state_dict(),
         "wm":        wm.state_dict(),
+        "q1":        q1.state_dict(),
+        "q2":        q2.state_dict(),
+        "q1_tgt":    q1_tgt.state_dict(),
+        "q2_tgt":    q2_tgt.state_dict(),
+        "log_alpha": log_alpha.detach().cpu(),
         "step":      step,
     }, path)
     print(f"  [saved → {path}  step={step}]")
@@ -572,14 +673,24 @@ def save_session(
 
 def load_session(
     path: str,
-    policy: Policy,
+    actor: Actor,
     projector: DeltaProjector,
     wm: WorldModel,
+    q1: Critic,
+    q2: Critic,
+    q1_tgt: Critic,
+    q2_tgt: Critic,
+    log_alpha: torch.Tensor,
 ) -> int:
     ckpt = torch.load(path, map_location=DEVICE)
-    policy.load_state_dict(ckpt["policy"])
+    actor.load_state_dict(ckpt["actor"])
     projector.load_state_dict(ckpt["projector"])
     wm.load_state_dict(ckpt["wm"])
+    q1.load_state_dict(ckpt["q1"])
+    q2.load_state_dict(ckpt["q2"])
+    q1_tgt.load_state_dict(ckpt["q1_tgt"])
+    q2_tgt.load_state_dict(ckpt["q2_tgt"])
+    log_alpha.data.copy_(ckpt["log_alpha"].to(DEVICE))
     step = ckpt.get("step", 0)
     print(f"  [loaded {path}  resuming at step {step}]")
     return step
@@ -600,14 +711,14 @@ def run(
     bridge: "MuseBridge | None" = None,
 ):
     """
-    explore_steps: number of random-action steps before policy takes over.
+    explore_steps: number of random-action steps before SAC policy takes over.
     mock_eeg:      use synthetic sine-wave EEG instead of real hardware.
     use_reve:      encode raw EEG through REVE-base instead of (mood, energy) coords.
     save_path:     checkpoint file for session persistence; None disables saving.
     save_interval: save checkpoint every N steps.
     dyna:          whether to use world-model dreaming between real steps.
     fullscreen:    display images fullscreen via pygame instead of image.show().
-    During exploration the world model accumulates data before policy training.
+    During exploration the world model accumulates data before SAC training begins.
     """
     print(f"Device: {DEVICE}")
     if mock_eeg:
@@ -627,18 +738,29 @@ def run(
     generator = ImageGenerator()
     base_emb  = load_base_embedding()  # (1, SEQ_LEN, GEMMA_DIM), frozen, pre-computed offline
 
-    policy    = Policy(coord_dim=coord_dim).to(DEVICE)
+    actor     = Actor(coord_dim=coord_dim).to(DEVICE)
     projector = DeltaProjector().to(DEVICE)
     wm        = WorldModel(coord_dim=coord_dim).to(DEVICE)
+    q1        = Critic(coord_dim=coord_dim).to(DEVICE)
+    q2        = Critic(coord_dim=coord_dim).to(DEVICE)
+    q1_tgt    = Critic(coord_dim=coord_dim).to(DEVICE)
+    q2_tgt    = Critic(coord_dim=coord_dim).to(DEVICE)
+    q1_tgt.load_state_dict(q1.state_dict())
+    q2_tgt.load_state_dict(q2.state_dict())
+    for p in (*q1_tgt.parameters(), *q2_tgt.parameters()):
+        p.requires_grad_(False)
+    log_alpha = torch.tensor(0.0, device=DEVICE, requires_grad=True)
     replay    = ReplayBuffer()
 
-    pol_opt = torch.optim.Adam(list(policy.parameters()) + list(projector.parameters()), lr=LR)
-    wm_opt  = torch.optim.Adam(wm.parameters(), lr=LR)
+    actor_opt = torch.optim.Adam(list(actor.parameters()) + list(projector.parameters()), lr=LR)
+    q_opt     = torch.optim.Adam(list(q1.parameters()) + list(q2.parameters()), lr=LR)
+    alpha_opt = torch.optim.Adam([log_alpha], lr=LR)
+    wm_opt    = torch.optim.Adam(wm.parameters(), lr=LR)
 
     # Load prior session if checkpoint exists
     step = 0
     if save_path and Path(save_path).exists():
-        step = load_session(save_path, policy, projector, wm)
+        step = load_session(save_path, actor, projector, wm, q1, q2, q1_tgt, q2_tgt, log_alpha)
 
     # Sample initial goal near the user's current EEG state
     first_coord = eeg.read()
@@ -650,7 +772,7 @@ def run(
     def _handle_sigint(sig, frame):
         print("\nSession ended by user.")
         if save_path:
-            save_session(save_path, policy, projector, wm, step)
+            save_session(save_path, actor, projector, wm, q1, q2, q1_tgt, q2_tgt, log_alpha, step)
         if fullscreen:
             import pygame  # noqa
             pygame.quit()
@@ -678,17 +800,11 @@ def run(
 
         if step < explore_steps:
             # Random exploration: scale down to 0.3 so images stay visually coherent
-            delta_t  = (torch.rand(1, DELTA_DIM, device=DEVICE) * 2 - 1) * 0.3
-            log_prob = None
+            delta_t = (torch.rand(1, DELTA_DIM, device=DEVICE) * 2 - 1) * 0.3
             print(f"  [explore {step+1}/{explore_steps}]", end="")
         else:
-            # Policy action with Gaussian noise for exploration
-            delta_mean = policy(obs)                        # (1, DELTA_DIM)
-            noise      = torch.randn_like(delta_mean) * 0.1
-            delta_t    = (delta_mean + noise).detach()
-            # log prob for REINFORCE (treating noise as fixed std Gaussian)
-            dist     = torch.distributions.Normal(delta_mean, 0.1)
-            log_prob = dist.log_prob(delta_t).sum()
+            with torch.no_grad():
+                delta_t, _ = actor.sample(obs)  # SAC explores via entropy, no manual noise needed
 
         # Clip delta magnitude so images don't jump wildly
         norm = delta_t.norm()
@@ -696,7 +812,7 @@ def run(
             delta_t = delta_t * DELTA_MAX_NORM / norm
 
         # --- 4. Project delta to Gemma space, build final embedding ---
-        with torch.no_grad() if step < explore_steps else torch.enable_grad():
+        with torch.no_grad():
             gemma_delta = projector(delta_t)               # (1, 1, GEMMA_DIM)
         final_emb = base_emb + gemma_delta                 # (1, SEQ_LEN, GEMMA_DIM)
 
@@ -715,7 +831,8 @@ def run(
         reward = -float(np.linalg.norm(next_coord - goal))
         print(f"  step={step}  |coord|={np.linalg.norm(coord):.2f}"
               f"  |next|={np.linalg.norm(next_coord):.2f}"
-              f"  reward={reward:.3f}")
+              f"  reward={reward:.3f}"
+              f"  α={log_alpha.exp().item():.3f}")
 
         if bridge:
             bridge.send_status(
@@ -724,22 +841,32 @@ def run(
 
         # --- 8. Store transition ---
         delta_np = delta_t.squeeze(0).cpu().detach().numpy()
-        replay.push(coord, delta_np, next_coord)
+        replay.push(coord, delta_np, reward, next_coord, goal)
 
         # --- 9. Update world model ---
         wm_loss = update_world_model(wm, wm_opt, replay)
 
-        # --- 10. Update policy (once past exploration) ---
-        if step >= explore_steps and log_prob is not None:
-            update_policy_reinforce(policy, pol_opt, log_prob, reward)
+        # --- 10. SAC policy update (once past exploration and buffer is ready) ---
+        if step >= explore_steps and len(replay) >= BATCH_SIZE:
+            coords_b, deltas_b, rewards_b, next_coords_b, goals_b = replay.sample(BATCH_SIZE)
+            obs_b      = torch.cat([coords_b, goals_b],      dim=-1)
+            next_obs_b = torch.cat([next_coords_b, goals_b], dim=-1)
+            update_sac(
+                actor, q1, q2, q1_tgt, q2_tgt, log_alpha,
+                actor_opt, q_opt, alpha_opt,
+                obs_b, deltas_b, rewards_b, next_obs_b,
+            )
             if dyna:
-                dyna_policy_update(policy, wm, pol_opt, replay, goal)
+                dyna_sac_update(
+                    actor, q1, q2, q1_tgt, q2_tgt, log_alpha,
+                    wm, actor_opt, q_opt, alpha_opt, replay,
+                )
 
         step += 1
 
         # --- 11. Periodic checkpoint ---
         if save_path and step % save_interval == 0:
-            save_session(save_path, policy, projector, wm, step)
+            save_session(save_path, actor, projector, wm, q1, q2, q1_tgt, q2_tgt, log_alpha, step)
 
 
 
@@ -751,7 +878,7 @@ def run(
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="EEG Neurofeedback RL with SANA-Sprint")
     p.add_argument("--explore-steps", type=int, default=20,
-                   help="Random exploration steps before policy takes over (default: 20).")
+                   help="Random exploration steps before SAC policy takes over (default: 20).")
     p.add_argument("--mock-eeg", action="store_true", default=False,
                    help="Use synthetic sine-wave EEG instead of real hardware.")
     p.add_argument("--reve", action="store_true", default=False,
@@ -763,7 +890,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--save-interval", type=int, default=10,
                    help="Save checkpoint every N steps (default: 10).")
     p.add_argument("--no-dyna", action="store_true", default=False,
-                   help="Disable world-model dreaming (pure online REINFORCE).")
+                   help="Disable world-model dreaming (SAC on real transitions only).")
     p.add_argument("--fullscreen", action="store_true", default=False,
                    help="Display images fullscreen via pygame (requires: pip install pygame).")
     p.add_argument("--bridge", action="store_true", default=False,
