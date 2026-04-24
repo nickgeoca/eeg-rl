@@ -14,6 +14,7 @@ import argparse
 
 import numpy as np
 import torch
+from scipy.signal import resample_poly
 from transformers import AutoModel
 
 # Standard 10-20 electrode names (19 channels)
@@ -26,6 +27,13 @@ DEFAULT_ELECTRODES = [
 ]
 
 SAMPLE_RATE = 200  # REVE requires input at exactly 200 Hz
+MUSE_SAMPLE_RATE = 256  # Muse 2 native sample rate
+MUSE_CHANNELS = ["TP9", "AF7", "AF8", "TP10"]
+
+
+def resample_to_200hz(eeg: np.ndarray) -> np.ndarray:
+    """Resample from 256 Hz to 200 Hz. Shape: (channels, time_points) → same shape ratio."""
+    return resample_poly(eeg, 25, 32, axis=1).astype(np.float32)
 
 
 def get_eeg() -> np.ndarray:
