@@ -1,31 +1,35 @@
 default:
     just --list
 
-# Run neurofeedback loop (default: real EEG + band powers). Pass --mock-eeg and/or --reve to override.
-run *args="":
+# Online RL training loop with real Muse 2 EEG via browser bridge
+train *args="":
     python eeg_rl_clip.py --bridge {{args}}
 
-# Run the full neurofeedback loop with mock EEG (2D mood/energy coords)
-sim:
+# Inference only — run a saved policy without updating weights (TODO: wire --inference-only flag)
+run *args="":
+    python eeg_rl_clip.py --bridge --no-dyna {{args}}
+
+# Train with mock EEG (2D mood/energy coords)
+train-mock:
     python eeg_rl_clip.py --mock-eeg
 
-# Run with REVE-base EEG encoder (69.2M) + mock EEG
-sim-reve:
+# Train with REVE-base EEG encoder (69.2M) + mock EEG
+train-reve:
     python eeg_rl_clip.py --mock-eeg --reve
 
-# Run fullscreen
-sim-fs:
+# Train with mock EEG, fullscreen display
+train-fs:
     python eeg_rl_clip.py --mock-eeg --fullscreen
 
-# Run fullscreen with REVE
-sim-reve-fs:
+# Train with REVE + mock EEG, fullscreen
+train-reve-fs:
     python eeg_rl_clip.py --mock-eeg --reve --fullscreen
 
-# Run without dreaming (pure online REINFORCE)
-sim-nodyna:
+# Train without dreaming (pure online REINFORCE)
+train-nodyna:
     python eeg_rl_clip.py --mock-eeg --no-dyna
 
-# Bake base Gemma embedding (run once before sim)
+# Bake base Gemma embedding (run once before training)
 bake:
     python bake_base_embedding.py
 
