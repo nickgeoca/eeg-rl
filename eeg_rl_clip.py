@@ -728,13 +728,15 @@ def load_session(
     log_alpha: torch.Tensor,
 ) -> int:
     ckpt = torch.load(path, map_location=DEVICE)
-    actor.load_state_dict(ckpt["actor"])
+    # support checkpoints saved before SAC refactor (policy → actor, no critics)
+    actor.load_state_dict(ckpt.get("actor") or ckpt["policy"])
     projector.load_state_dict(ckpt["projector"])
     wm.load_state_dict(ckpt["wm"])
-    q1.load_state_dict(ckpt["q1"])
-    q2.load_state_dict(ckpt["q2"])
-    q1_tgt.load_state_dict(ckpt["q1_tgt"])
-    q2_tgt.load_state_dict(ckpt["q2_tgt"])
+    if "q1" in ckpt:
+        q1.load_state_dict(ckpt["q1"])
+        q2.load_state_dict(ckpt["q2"])
+        q1_tgt.load_state_dict(ckpt["q1_tgt"])
+        q2_tgt.load_state_dict(ckpt["q2_tgt"])
     log_alpha.data.copy_(ckpt["log_alpha"].to(DEVICE))
     step = ckpt.get("step", 0)
     print(f"  [loaded {path}  resuming at step {step}]")
