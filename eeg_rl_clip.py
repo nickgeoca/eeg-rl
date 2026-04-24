@@ -260,31 +260,43 @@ class EEGSource:
     """
     Wraps hardware EEG or a synthetic mock for smoke-testing.
 
-    mood   ∈ [-1, 1]: valence axis (negative=unpleasant, positive=pleasant)
-    energy ∈ [-1, 1]: arousal axis (negative=calm/sleepy, positive=excited)
+    mood   ∈ [-1, 1]: alpha dominance (relaxed/pleasant vs tense)
+    energy ∈ [-1, 1]: beta dominance (alert/excited vs calm)
+
+    With a MuseBridge: derives mood/energy from band powers of the raw EEG window.
+    Without a bridge:  mock sine-wave drift.
     """
 
-    def __init__(self, mock: bool = False, smooth_window: int = 3):
+    def __init__(self, mock: bool = False, smooth_window: int = 3, bridge=None):
         self.mock = mock
+        self._bridge = bridge
         self._history: deque = deque(maxlen=smooth_window)
         self._t0 = time.time()
 
-        if not mock:
-            # STUB: initialise Elata SDK connection here, e.g.:
-            #   import elata
-            #   self._elata = elata.connect()
+        if not mock and bridge is None:
             raise NotImplementedError(
-                "Real EEG not connected. Run with --mock-eeg for smoke testing."
+                "Pass a MuseBridge (--bridge) or use --mock-eeg for smoke testing."
             )
 
     def read(self) -> np.ndarray:
         """Return instantaneous (mood, energy) as a 1-D float32 array."""
         if self.mock:
             return self._mock_read()
-        # STUB: replace with actual Elata SDK call, e.g.:
-        #   state = self._elata.get_state()
-        #   return np.array([state.mood, state.energy], dtype=np.float32)
-        raise NotImplementedError("Connect Elata SDK here")
+        return self._band_power_read()
+
+    def _band_power_read(self) -> np.ndarray:
+        """Derive (mood, energy) from alpha/beta band powers of the EEG window."""
+        from scipy.signal import welch
+        window = self._bridge.get_window()  # (4, 400) at 200 Hz
+        freqs, psd = welch(window, fs=200, axis=1, nperseg=min(256, window.shape[1]))
+        psd_mean = psd.mean(axis=0)
+        alpha = psd_mean[(freqs >= 8)  & (freqs <= 13)].mean()
+        beta  = psd_mean[(freqs >= 13) & (freqs <= 30)].mean()
+        theta = psd_mean[(freqs >= 4)  & (freqs <= 8)].mean()
+        total = alpha + beta + theta + 1e-9
+        mood   = float(np.clip(alpha / total * 3 - 1, -1, 1))
+        energy = float(np.clip(beta  / total * 3 - 1, -1, 1))
+        return np.array([mood, energy], dtype=np.float32)
 
     def _mock_read(self) -> np.ndarray:
         t = time.time() - self._t0
@@ -763,7 +775,7 @@ def run(
         print("EEG encoder: REVE-base (69.2M)")
         eeg = REVEEEGSource(mock=mock_eeg, bridge=bridge)
     else:
-        eeg = EEGSource(mock=mock_eeg)
+        eeg = EEGSource(mock=mock_eeg, bridge=bridge)
 
     coord_dim = eeg.coord_dim
     if use_reve:
