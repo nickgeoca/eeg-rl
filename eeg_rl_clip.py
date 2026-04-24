@@ -30,21 +30,17 @@ import argparse
 import asyncio
 import base64
 import json
-import mimetypes
 import os
 import signal
 import threading
 import time
 from collections import deque
-from http.server import HTTPServer, SimpleHTTPRequestHandler
 from io import BytesIO
 
 import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
-
-mimetypes.add_type("application/wasm", ".wasm")
 
 # Load .env if present so HF_TOKEN is available before any model download
 _env_path = os.path.join(os.path.dirname(__file__), ".env")
@@ -84,37 +80,16 @@ SAC_TARGET_ENTROPY = -float(DELTA_DIM) # entropy target for alpha auto-tuning
 LOG_STD_MIN, LOG_STD_MAX = -5, 2
 
 # ---------------------------------------------------------------------------
-# Browser bridge — HTTP + WebSocket servers
+# Browser bridge — WebSocket server (Vite serves the frontend)
 # ---------------------------------------------------------------------------
-
-_SDK_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../elata-bio-sdk"))
-
-
-class _BridgeHTTPHandler(SimpleHTTPRequestHandler):
-    """Serves bridge.html from the project dir; /elata/* maps to the SDK."""
-
-    def translate_path(self, path):
-        if path.startswith("/elata/"):
-            return os.path.join(_SDK_ROOT, path[len("/elata/"):].lstrip("/"))
-        return super().translate_path(path)
-
-    def log_message(self, *args):
-        pass
-
-    def handle_error(self, request, client_address):
-        import errno, sys
-        exc = sys.exc_info()[1]
-        if isinstance(exc, BrokenPipeError) or (isinstance(exc, OSError) and exc.errno == errno.ECONNRESET):
-            return
-        super().handle_error(request, client_address)
 
 
 class MuseBridge:
     """
-    HTTP + WebSocket bridge between the Muse 2 browser page and Python.
+    WebSocket bridge between the Muse 2 browser page and Python.
 
-    Background threads run an HTTP server (serves bridge.html + elata SDK)
-    and a WebSocket server (receives EEG frames, sends images).
+    Vite serves bridge.html on port 8080. This class only runs the WebSocket
+    server that receives EEG frames and sends images/status back.
 
     Thread-safe API for the main loop:
         get_window()      → np.ndarray (4, 400) at 200 Hz — blocks until 2 s ready
@@ -126,9 +101,8 @@ class MuseBridge:
     _IN_HZ     = 256
     _WINDOW_IN = int(2.0 * _IN_HZ)  # 512 samples = 2 s at 256 Hz
 
-    def __init__(self, ws_port: int = 8765, http_port: int = 8080):
+    def __init__(self, ws_port: int = 8765):
         self._ws_port   = ws_port
-        self._http_port = http_port
         self._buf: deque = deque(maxlen=self._WINDOW_IN * 4)
         self._buf_lock   = threading.Lock()
         self._data_ready = threading.Event()
@@ -136,18 +110,13 @@ class MuseBridge:
         self._connections: set = set()
         self._started = threading.Event()
 
-        threading.Thread(target=self._run_http, daemon=True).start()
-        threading.Thread(target=self._run_ws,   daemon=True).start()
+        threading.Thread(target=self._run_ws, daemon=True).start()
         self._started.wait()
-        print(f"  Bridge ready → open http://localhost:{http_port}/bridge.html in Chrome")
+        print(f"  Bridge ready → open http://localhost:8080/bridge.html in Brave/Chrome")
 
     # ------------------------------------------------------------------
     # Background threads
     # ------------------------------------------------------------------
-
-    def _run_http(self):
-        server = HTTPServer(("localhost", self._http_port), _BridgeHTTPHandler)
-        server.serve_forever()
 
     def _run_ws(self):
         import websockets
@@ -951,8 +920,7 @@ def _parse_args() -> argparse.Namespace:
                    help="Display images fullscreen via pygame (requires: pip install pygame).")
     p.add_argument("--bridge", action="store_true", default=False,
                    help="Use browser bridge: serves bridge.html + receives Muse 2 EEG via WebSocket.")
-    p.add_argument("--ws-port",   type=int, default=8765, help="WebSocket port (default: 8765).")
-    p.add_argument("--http-port", type=int, default=8080, help="HTTP server port (default: 8080).")
+    p.add_argument("--ws-port", type=int, default=8765, help="WebSocket port (default: 8765).")
     p.add_argument("--inference-only", action="store_true", default=False,
                    help="Freeze weights: skip replay, world-model, and SAC updates.")
     return p.parse_args()
@@ -960,7 +928,7 @@ def _parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = _parse_args()
-    bridge = MuseBridge(ws_port=args.ws_port, http_port=args.http_port) if args.bridge else None
+    bridge = MuseBridge(ws_port=args.ws_port) if args.bridge else None
     run(
         explore_steps=args.explore_steps,
         mock_eeg=args.mock_eeg,

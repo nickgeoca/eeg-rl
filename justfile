@@ -1,12 +1,25 @@
 default:
     just --list
 
+# Install JS dependencies (run once after cloning)
+npm-install:
+    npm install
+
+# Start Vite dev server on :8080 (idempotent — skips if already running)
+_vite:
+    #!/usr/bin/env bash
+    if ! ss -tlnp | grep -q ':8080'; then
+        npx vite &
+        disown
+        echo "Vite started → http://localhost:8080/bridge.html"
+    fi
+
 # Start synthetic Muse BLE bridge (run in a separate terminal, then open bridge.html)
 sim:
     cargo run --manifest-path ../elata-bio-sdk/Cargo.toml -p elata-dev-synthetic-ble-bridge
 
 # Online RL training loop (connect real Muse or run `just sim` first)
-train:
+train: _vite
     #!/usr/bin/env bash
     echo "EEG embedding:"
     echo "  1) Band powers — 2D mood/energy (fast, interpretable)"
@@ -18,7 +31,7 @@ train:
     esac
 
 # Inference only — run a saved policy without updating weights
-run:
+run: _vite
     #!/usr/bin/env bash
     echo "EEG embedding:"
     echo "  1) Band powers — 2D mood/energy (fast, interpretable)"

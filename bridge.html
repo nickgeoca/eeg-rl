@@ -3,7 +3,6 @@
 <head>
   <meta charset="utf-8">
   <title>EEG Neurofeedback</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { background: #000; color: #eee; font-family: monospace; overflow: hidden; }
@@ -61,13 +60,6 @@
       color: rgba(255,255,255,0.2); z-index: 20; pointer-events: none;
     }
   </style>
-  <script type="importmap">
-  {
-    "imports": {
-      "@elata-biosciences/eeg-web": "/elata/packages/eeg-web/dist/index.js"
-    }
-  }
-  </script>
 </head>
 <body>
   <img id="display" alt="">
@@ -94,6 +86,11 @@
   <div id="click-hint"></div>
 
   <script type="module">
+    import Chart from 'chart.js/auto';
+    import { initEegWasm, AthenaWasmDecoder, getEegInterleavedSamples } from '@elata-biosciences/eeg-web';
+    import { BleTransport } from '@elata-biosciences/eeg-web-ble';
+    import wasmUrl from '@elata-biosciences/eeg-web/wasm/eeg_wasm_bg.wasm?url';
+
     const display    = document.getElementById("display");
     const overlay    = document.getElementById("overlay");
     const statusEl   = document.getElementById("status");
@@ -177,7 +174,6 @@
     function onMetrics(msg) {
       const { step, coord, reward, wm_loss, actor_loss, q_loss } = msg;
 
-      // Build coord datasets on first message
       if (!coordInited) {
         coordInited = true;
         const labels = coord.length === 2
@@ -187,7 +183,6 @@
         chartState.update("none");
       }
 
-      // Push coord
       stateData.labels.push(step);
       coord.forEach((v, i) => { if (stateData.datasets[i]) stateData.datasets[i].data.push(v); });
       if (stateData.labels.length > MAX_PTS) {
@@ -195,7 +190,6 @@
         stateData.datasets.forEach(ds => ds.data.shift());
       }
 
-      // Push RL metrics (null renders as gap)
       rlData.labels.push(step);
       rlData.datasets[0].data.push(reward);
       rlData.datasets[1].data.push(wm_loss);
@@ -244,12 +238,7 @@
     let transport = null;
 
     try {
-      const { initEegWasm, AthenaWasmDecoder, getEegInterleavedSamples } =
-        await import("@elata-biosciences/eeg-web");
-      const { BleTransport } =
-        await import("/elata/packages/eeg-web-ble/dist/index.js");
-
-      await initEegWasm("/elata/packages/eeg-web/wasm/eeg_wasm_bg.wasm");
+      await initEegWasm(wasmUrl);
       setStatus("WASM ready — press Connect Muse");
 
       transport = new BleTransport({

@@ -1,0 +1,16 @@
+{
+  "name": "eeg-rl-bridge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite"
+  },
+  "dependencies": {
+    "@elata-biosciences/eeg-web": "^0.1.17",
+    "@elata-biosciences/eeg-web-ble": "^0.1.17",
+    "chart.js": "^4.4.0"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  }
+}
