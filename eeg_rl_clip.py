@@ -29,6 +29,7 @@ Stubs are marked with: # STUB
 import argparse
 import asyncio
 import base64
+import csv
 import json
 import os
 import signal
@@ -799,6 +800,13 @@ def run(
     if save_path and Path(save_path).exists():
         step = load_session(save_path, actor, projector, wm, q1, q2, q1_tgt, q2_tgt, log_alpha)
 
+    # CSV metrics log — one row per step, appended so resumed sessions accumulate
+    log_path = save_path.replace(".pt", "_log.csv") if save_path else "session_log.csv"
+    _log_file = open(log_path, "a", newline="")
+    _log_writer = csv.writer(_log_file)
+    if _log_file.tell() == 0:
+        _log_writer.writerow(["step", "timestamp", "coord", "goal", "reward", "wm_loss", "actor_loss", "q_loss"])
+
     if inference_only:
         actor.eval()
         projector.eval()
@@ -815,6 +823,9 @@ def run(
         print("\nSession ended by user.")
         if save_path and not inference_only:
             save_session(save_path, actor, projector, wm, q1, q2, q1_tgt, q2_tgt, log_alpha, step)
+        _log_file.flush()
+        _log_file.close()
+        print(f"  [log → {log_path}]")
         if fullscreen:
             import pygame  # noqa
             pygame.quit()
@@ -824,6 +835,8 @@ def run(
     print("Starting neurofeedback loop. Ctrl-C to stop.")
     print(f"  First goal (norm={np.linalg.norm(goal):.2f})  radius={goal_radius:.2f}")
 
+    _prev_coord = None
+
     while True:
         # Block here while browser has pressed Stop
         if bridge:
@@ -831,6 +844,8 @@ def run(
 
         # --- 1. Read current EEG state ---
         coord = eeg.read()  # (coord_dim,)
+        if _prev_coord is not None and np.allclose(coord, _prev_coord, atol=1e-4):
+            print("  WARNING: EEG coord identical to previous step — signal may be stale/disconnected")
 
         # --- 2. Refresh goal if interval elapsed ---
         if time.time() - goal_timer > GOAL_INTERVAL:
@@ -913,7 +928,21 @@ def run(
         if bridge:
             bridge.send_metrics(step, coord, reward, wm_loss, actor_loss, q_loss)
 
-        # --- 11. Periodic checkpoint ---
+        # --- 11. Log metrics row ---
+        _log_writer.writerow([
+            step,
+            round(time.time(), 3),
+            json.dumps(coord.tolist()),
+            json.dumps(goal.tolist()),
+            round(reward, 6),
+            round(wm_loss, 6) if wm_loss is not None else "",
+            round(actor_loss, 6) if actor_loss is not None else "",
+            round(q_loss, 6) if q_loss is not None else "",
+        ])
+        _log_file.flush()
+        _prev_coord = next_coord.copy()
+
+        # --- 12. Periodic checkpoint ---
         if not inference_only and save_path and step % save_interval == 0:
             save_session(save_path, actor, projector, wm, q1, q2, q1_tgt, q2_tgt, log_alpha, step)
 
