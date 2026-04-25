@@ -72,6 +72,10 @@
 
   <div id="debug-panel">
     <div class="chart-block">
+      <div class="chart-title">Raw EEG (µV)</div>
+      <div class="chart-wrap"><canvas id="chart-eeg"></canvas></div>
+    </div>
+    <div class="chart-block">
       <div class="chart-title">EEG State</div>
       <div class="chart-wrap"><canvas id="chart-state"></canvas></div>
     </div>
@@ -149,6 +153,39 @@
     function makeDs(label, color) {
       return { label, data: [], borderColor: color, borderWidth: 1.5,
                pointRadius: 0, tension: 0.3, fill: false };
+    }
+
+    const EEG_PTS = 256;
+    const EEG_CH_COLORS = ["#4fc3f7","#81c784","#ffb74d","#f06292","#ce93d8","#80cbc4","#fff176","#ffab91"];
+    const eegData = { labels: Array.from({length: EEG_PTS}, (_, i) => i), datasets: [] };
+    let eegInited = false;
+    let eegTick = 0;
+
+    const chartEeg = new Chart(document.getElementById("chart-eeg"), {
+      type: "line",
+      data: eegData,
+      options: {
+        ...BASE_OPTS,
+        plugins: { ...BASE_OPTS.plugins, legend: { ...BASE_OPTS.plugins.legend, labels: { ...BASE_OPTS.plugins.legend.labels, boxWidth: 10, font: { family: "monospace", size: 9 } } } },
+      },
+    });
+
+    function pushEegSamples(samples, channelCount) {
+      if (!eegInited) {
+        eegInited = true;
+        eegData.datasets = Array.from({length: channelCount}, (_, i) =>
+          ({ label: `ch${i}`, data: new Array(EEG_PTS).fill(null),
+             borderColor: EEG_CH_COLORS[i % EEG_CH_COLORS.length],
+             borderWidth: 1, pointRadius: 0, tension: 0, fill: false })
+        );
+        chartEeg.update("none");
+      }
+      for (const row of samples) {
+        const idx = eegTick % EEG_PTS;
+        row.forEach((v, ch) => { if (eegData.datasets[ch]) eegData.datasets[ch].data[idx] = v; });
+        eegTick++;
+      }
+      chartEeg.update("none");
     }
 
     const stateData = { labels: [], datasets: [] };
@@ -246,7 +283,6 @@
       });
 
       transport.onFrame = (frame) => {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
         const { channelCount } = frame.eeg;
         const interleaved = getEegInterleavedSamples(frame);
         const nSamples = interleaved.length / channelCount;
@@ -256,6 +292,8 @@
             Array.from(interleaved.subarray(i * channelCount, (i + 1) * channelCount))
           );
         }
+        if (showingDebug) pushEegSamples(samples, channelCount);
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
         ws.send(JSON.stringify({ type: "eeg_frame", samples }));
       };
 
