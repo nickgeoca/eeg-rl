@@ -102,6 +102,14 @@ class MuseBridge:
     _WINDOW_IN = int(2.0 * _IN_HZ)  # 512 samples = 2 s at 256 Hz
 
     def __init__(self, ws_port: int = 8765):
+        import subprocess, time, os, signal
+        result = subprocess.run(["ss", "-Htlnp", f"sport = :{ws_port}"], capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if f":{ws_port}" in line and "pid=" in line:
+                pid = int(line.split("pid=")[1].split(",")[0])
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(0.3)
+                break
         self._ws_port   = ws_port
         self._buf: deque = deque(maxlen=self._WINDOW_IN * 4)
         self._buf_lock   = threading.Lock()
