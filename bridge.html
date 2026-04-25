@@ -252,6 +252,22 @@
       chartRL.update("none");
     }
 
+    // ---------- Title spinner (shows while image is generating) ----------
+    const spinFrames = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+    let spinIdx = 0, spinTimer = null;
+
+    function startSpin() {
+      if (spinTimer) return;
+      spinTimer = setInterval(() => {
+        document.title = spinFrames[spinIdx++ % spinFrames.length] + ' EEG Neurofeedback';
+      }, 100);
+    }
+
+    function stopSpin() {
+      clearInterval(spinTimer); spinTimer = null;
+      document.title = 'EEG Neurofeedback';
+    }
+
     // ---------- WebSocket (auto-reconnect) ----------
     let ws = null;
 
@@ -266,6 +282,7 @@
       ws.onmessage = (e) => {
         const msg = JSON.parse(e.data);
         if (msg.type === "image") {
+          stopSpin();
           display.src = msg.data;
           if (!showingDebug) {
             display.style.display = "block";
@@ -275,6 +292,7 @@
         } else if (msg.type === "status") {
           setHud(msg.text);
         } else if (msg.type === "metrics") {
+          startSpin();
           onMetrics(msg);
         } else if (msg.type === "train_state") {
           setTrainState(msg.running);
