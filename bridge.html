@@ -59,6 +59,15 @@
       position: fixed; bottom: 12px; right: 14px; font-size: 0.65rem;
       color: rgba(255,255,255,0.2); z-index: 20; pointer-events: none;
     }
+    #train-btn {
+      position: fixed; top: 12px; left: 14px; z-index: 50;
+      background: none; border: 1px solid #333; font-size: 0.75rem;
+      font-family: monospace; color: #888; cursor: pointer; padding: 4px 10px;
+      border-radius: 4px; transition: border-color 0.15s, color 0.15s;
+    }
+    #train-btn:hover { border-color: #888; color: #eee; }
+    #train-btn.stopped { border-color: #4a4; color: #6d6; }
+    #train-btn.running { border-color: #a44; color: #d66; }
   </style>
 </head>
 <body>
@@ -86,6 +95,7 @@
   </div>
 
   <button id="bug-btn" title="toggle debug view">🐛</button>
+  <button id="train-btn" title="start/stop training">⏹ stop</button>
   <div id="hud"></div>
   <div id="click-hint"></div>
 
@@ -102,6 +112,7 @@
     const hint       = document.getElementById("click-hint");
     const debugPanel = document.getElementById("debug-panel");
     const bugBtn     = document.getElementById("bug-btn");
+    const trainBtn   = document.getElementById("train-btn");
     const btn        = document.getElementById("connectBtn");
 
     function setStatus(msg) { statusEl.textContent = msg; }
@@ -265,11 +276,36 @@
           setHud(msg.text);
         } else if (msg.type === "metrics") {
           onMetrics(msg);
+        } else if (msg.type === "train_state") {
+          setTrainState(msg.running);
         }
       };
     }
 
     connectWs();
+
+    // ---------- Train start/stop ----------
+    let trainRunning = true;
+
+    function setTrainState(running) {
+      trainRunning = running;
+      if (running) {
+        trainBtn.textContent = "⏹ stop";
+        trainBtn.className = "running";
+      } else {
+        trainBtn.textContent = "▶ start";
+        trainBtn.className = "stopped";
+      }
+    }
+
+    trainBtn.addEventListener("click", () => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (trainRunning) {
+        ws.send(JSON.stringify({ type: "train_stop" }));
+      } else {
+        ws.send(JSON.stringify({ type: "train_start" }));
+      }
+    });
 
     // ---------- BLE + WASM ----------
     let transport = null;

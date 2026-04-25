@@ -109,6 +109,8 @@ class MuseBridge:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._connections: set = set()
         self._started = threading.Event()
+        self._running = threading.Event()
+        self._running.set()  # start in running state
 
         threading.Thread(target=self._run_ws, daemon=True).start()
         self._started.wait()
@@ -133,6 +135,8 @@ class MuseBridge:
 
     async def _handler(self, ws):
         self._connections.add(ws)
+        # Send current running state so a freshly-opened browser tab syncs up
+        await ws.send(json.dumps({"type": "train_state", "running": self._running.is_set()}))
         try:
             async for raw in ws:
                 msg = json.loads(raw)
@@ -142,8 +146,18 @@ class MuseBridge:
                         self._buf.extend(samples)
                         if len(self._buf) >= self._WINDOW_IN:
                             self._data_ready.set()
+                elif msg.get("type") == "train_stop":
+                    self._running.clear()
+                    self._broadcast(json.dumps({"type": "train_state", "running": False}))
+                elif msg.get("type") == "train_start":
+                    self._running.set()
+                    self._broadcast(json.dumps({"type": "train_state", "running": True}))
         finally:
             self._connections.discard(ws)
+
+    def wait_if_stopped(self) -> None:
+        """Block the training loop while the browser has pressed Stop."""
+        self._running.wait()
 
     # ------------------------------------------------------------------
     # Main-thread API
@@ -256,6 +270,7 @@ class EEGSource:
         """Derive (mood, energy) from alpha/beta band powers of the EEG window."""
         from scipy.signal import welch
         window = self._bridge.get_window()  # (4, 400) at 200 Hz
+        window = np.clip(window - window.mean(axis=1, keepdims=True), -100.0, 100.0)
         freqs, psd = welch(window, fs=200, axis=1, nperseg=min(256, window.shape[1]))
         psd_mean = psd.mean(axis=0)
         alpha = psd_mean[(freqs >= 8)  & (freqs <= 13)].mean()
@@ -325,6 +340,7 @@ class REVEEEGSource:
     def read(self) -> np.ndarray:
         """Encode one EEG segment and return mean-pooled flat vector."""
         eeg = self._raw_eeg()
+        eeg = (eeg - eeg.mean(axis=1, keepdims=True)) / (eeg.std(axis=1, keepdims=True) + 1e-6)
         emb = self._encoder.encode(eeg)             # (1, tokens, hidden)
         flat = emb.squeeze(0).mean(0).cpu().numpy() # (hidden,)
         self._coord_dim = flat.shape[0]
@@ -801,6 +817,10 @@ def run(
     print(f"  First goal (norm={np.linalg.norm(goal):.2f})  radius={goal_radius:.2f}")
 
     while True:
+        # Block here while browser has pressed Stop
+        if bridge:
+            bridge.wait_if_stopped()
+
         # --- 1. Read current EEG state ---
         coord = eeg.read()  # (coord_dim,)
 
