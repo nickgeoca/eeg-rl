@@ -149,11 +149,10 @@ class MuseBridge:
     # Main-thread API
     # ------------------------------------------------------------------
 
-    def get_window(self, timeout: float = 60.0) -> np.ndarray:
+    def get_window(self) -> np.ndarray:
         """Return the latest 2 s EEG window resampled to 200 Hz. Shape: (4, 400)."""
         from reve import resample_to_200hz
-        if not self._data_ready.wait(timeout=timeout):
-            raise TimeoutError("No EEG data received from browser within timeout")
+        self._data_ready.wait()
         with self._buf_lock:
             tail = list(self._buf)[-self._WINDOW_IN:]
         arr = np.array(tail, dtype=np.float32).T  # (4, 512)
@@ -187,7 +186,7 @@ class MuseBridge:
             "type": "metrics",
             "step": step,
             "reward": round(float(reward), 4),
-            "wm_loss": round(float(wm_loss), 4),
+            "wm_loss": round(float(wm_loss), 4) if wm_loss is not None else None,
             "actor_loss": round(float(actor_loss), 4) if actor_loss is not None else None,
             "q_loss": round(float(q_loss), 4) if q_loss is not None else None,
             "coord": coord.tolist()[:8],
@@ -362,8 +361,7 @@ class ImageGenerator:
             torch_dtype=torch.bfloat16,
         ).to(DEVICE)
         self.pipe.vae.enable_tiling(tile_sample_min_width=512, tile_sample_min_height=512)
-        # Uncomment to offload heavy blocks to CPU between steps (saves VRAM):
-        # self.pipe.enable_model_cpu_offload()
+        self.pipe.enable_model_cpu_offload()
         print("Pipeline ready.")
 
     def generate(self, prompt_embeds: torch.Tensor) -> Image.Image:
@@ -791,7 +789,7 @@ def run(
     # Graceful Ctrl-C: save checkpoint and quit pygame before exit
     def _handle_sigint(sig, frame):
         print("\nSession ended by user.")
-        if save_path:
+        if save_path and not inference_only:
             save_session(save_path, actor, projector, wm, q1, q2, q1_tgt, q2_tgt, log_alpha, step)
         if fullscreen:
             import pygame  # noqa
@@ -859,6 +857,7 @@ def run(
                 f"step={step}  reward={reward:.3f}  |coord|={np.linalg.norm(coord):.2f}"
             )
 
+        wm_loss, actor_loss, q_loss = None, None, None
         if not inference_only:
             # --- 8. Store transition ---
             delta_np = delta_t.squeeze(0).cpu().detach().numpy()
@@ -868,7 +867,6 @@ def run(
             wm_loss = update_world_model(wm, wm_opt, replay)
 
             # --- 10. SAC policy update (once past exploration and buffer is ready) ---
-            actor_loss, q_loss = None, None
             if step >= explore_steps and len(replay) >= BATCH_SIZE:
                 coords_b, deltas_b, rewards_b, next_coords_b, goals_b = replay.sample(BATCH_SIZE)
                 obs_b      = torch.cat([coords_b, goals_b],      dim=-1)
@@ -884,12 +882,12 @@ def run(
                         wm, actor_opt, q_opt, alpha_opt, replay,
                     )
 
-            if bridge:
-                bridge.send_metrics(step, coord, reward, wm_loss, actor_loss, q_loss)
+        if bridge:
+            bridge.send_metrics(step, coord, reward, wm_loss, actor_loss, q_loss)
 
-            # --- 11. Periodic checkpoint ---
-            if save_path and step % save_interval == 0:
-                save_session(save_path, actor, projector, wm, q1, q2, q1_tgt, q2_tgt, log_alpha, step)
+        # --- 11. Periodic checkpoint ---
+        if not inference_only and save_path and step % save_interval == 0:
+            save_session(save_path, actor, projector, wm, q1, q2, q1_tgt, q2_tgt, log_alpha, step)
 
         step += 1
 
