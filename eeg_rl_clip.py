@@ -115,6 +115,7 @@ class MuseBridge:
         self._buf: deque = deque(maxlen=self._WINDOW_IN * 4)
         self._buf_lock   = threading.Lock()
         self._data_ready = threading.Event()
+        self._last_frame_time: float = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._connections: set = set()
         self._started = threading.Event()
@@ -155,6 +156,7 @@ class MuseBridge:
                         self._buf.extend(samples)
                         if len(self._buf) >= self._WINDOW_IN:
                             self._data_ready.set()
+                    self._last_frame_time = time.monotonic()
                 elif msg.get("type") == "train_stop":
                     self._running.clear()
                     self._broadcast(json.dumps({"type": "train_state", "running": False}))
@@ -172,14 +174,34 @@ class MuseBridge:
     # Main-thread API
     # ------------------------------------------------------------------
 
+    _EEG_TIMEOUT = 5.0  # seconds without a frame before declaring disconnect
+
     def get_window(self) -> np.ndarray:
-        """Return the latest 2 s EEG window resampled to 200 Hz. Shape: (4, 400)."""
+        """Return the latest 2 s EEG window resampled to 200 Hz. Shape: (4, 400).
+
+        Blocks until a fresh frame arrives. If no frame is received within
+        _EEG_TIMEOUT seconds, broadcasts eeg_disconnected to the browser and
+        keeps waiting. Broadcasts eeg_reconnected when data resumes.
+        """
         from reve import resample_to_200hz
-        self._data_ready.wait()
-        with self._buf_lock:
-            tail = list(self._buf)[-self._WINDOW_IN:]
-        arr = np.array(tail, dtype=np.float32).T  # (4, 512)
-        return resample_to_200hz(arr)              # (4, 400)
+        disconnected = False
+        while True:
+            if self._data_ready.wait(timeout=self._EEG_TIMEOUT):
+                if time.monotonic() - self._last_frame_time <= self._EEG_TIMEOUT:
+                    if disconnected:
+                        print("  EEG reconnected — resuming")
+                        self._broadcast(json.dumps({"type": "eeg_reconnected"}))
+                    self._data_ready.clear()
+                    with self._buf_lock:
+                        tail = list(self._buf)[-self._WINDOW_IN:]
+                    arr = np.array(tail, dtype=np.float32).T  # (4, 512)
+                    return resample_to_200hz(arr)              # (4, 400)
+                # flag still set from pre-disconnect data — clear and fall through
+                self._data_ready.clear()
+            if not disconnected:
+                disconnected = True
+                print("  EEG disconnected — pausing, waiting for reconnect…")
+                self._broadcast(json.dumps({"type": "eeg_disconnected"}))
 
     def send_image(self, img: "Image.Image") -> None:
         if not self._connections or self._loop is None:
@@ -835,8 +857,6 @@ def run(
     print("Starting neurofeedback loop. Ctrl-C to stop.")
     print(f"  First goal (norm={np.linalg.norm(goal):.2f})  radius={goal_radius:.2f}")
 
-    _prev_coord = None
-
     while True:
         # Block here while browser has pressed Stop
         if bridge:
@@ -844,8 +864,6 @@ def run(
 
         # --- 1. Read current EEG state ---
         coord = eeg.read()  # (coord_dim,)
-        if _prev_coord is not None and np.allclose(coord, _prev_coord, atol=1e-4):
-            print("  WARNING: EEG coord identical to previous step — signal may be stale/disconnected")
 
         # --- 2. Refresh goal if interval elapsed ---
         if time.time() - goal_timer > GOAL_INTERVAL:
@@ -940,7 +958,6 @@ def run(
             round(q_loss, 6) if q_loss is not None else "",
         ])
         _log_file.flush()
-        _prev_coord = next_coord.copy()
 
         # --- 12. Periodic checkpoint ---
         if not inference_only and save_path and step % save_interval == 0:

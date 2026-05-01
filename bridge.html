@@ -68,6 +68,13 @@
     #train-btn:hover { border-color: #888; color: #eee; }
     #train-btn.stopped { border-color: #4a4; color: #6d6; }
     #train-btn.running { border-color: #a44; color: #d66; }
+
+    #eeg-banner {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: #7a1010; color: #ffcccc; padding: 7px 16px;
+      font-size: 0.8rem; text-align: center; display: none;
+    }
+    #eeg-banner.visible { display: block; }
   </style>
 </head>
 <body>
@@ -94,6 +101,7 @@
     </div>
   </div>
 
+  <div id="eeg-banner">EEG disconnected — reconnecting…</div>
   <button id="bug-btn" title="toggle debug view">🐛</button>
   <button id="train-btn" title="start/stop training">⏹ stop</button>
   <div id="hud"></div>
@@ -114,6 +122,7 @@
     const bugBtn     = document.getElementById("bug-btn");
     const trainBtn   = document.getElementById("train-btn");
     const btn        = document.getElementById("connectBtn");
+    const eegBanner  = document.getElementById("eeg-banner");
 
     function setStatus(msg) { statusEl.textContent = msg; }
     function setHud(msg)    { hud.textContent = msg; }
@@ -296,6 +305,13 @@
           onMetrics(msg);
         } else if (msg.type === "train_state") {
           setTrainState(msg.running);
+        } else if (msg.type === "eeg_disconnected") {
+          eegBanner.classList.add("visible");
+          if (!reconnectTimer && bleHasDevice && !bleStreaming) {
+            reconnectTimer = setTimeout(tryBleReconnect, 1000);
+          }
+        } else if (msg.type === "eeg_reconnected") {
+          eegBanner.classList.remove("visible");
         }
       };
     }
@@ -327,6 +343,30 @@
 
     // ---------- BLE + WASM ----------
     let transport = null;
+    let bleStreaming = false;
+    let bleHasDevice = false;
+    let reconnectTimer = null;
+
+    function clearReconnectTimer() {
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    }
+
+    async function tryBleReconnect() {
+      reconnectTimer = null;
+      if (!transport || !bleHasDevice || bleStreaming) return;
+      setStatus("Reconnecting to Muse…");
+      try {
+        await transport.startStreaming();
+        bleStreaming = true;
+        btn.textContent = "Streaming";
+        btn.disabled = true;
+      } catch (err) {
+        setStatus(`Reconnect failed — retrying in 3s… (or press Connect Muse)`);
+        btn.disabled = false;
+        btn.textContent = "Connect Muse";
+        reconnectTimer = setTimeout(tryBleReconnect, 3000);
+      }
+    }
 
     try {
       await initEegWasm(wasmUrl);
@@ -353,6 +393,19 @@
 
       transport.onStatus = (s) => {
         setStatus(`Muse: ${s.state}${s.reason ? " — " + s.reason : ""}`);
+        if (/disconnect|error/i.test(s.state) && bleStreaming) {
+          bleStreaming = false;
+          btn.disabled = false;
+          btn.textContent = "Connect Muse";
+          if (!reconnectTimer) reconnectTimer = setTimeout(tryBleReconnect, 2000);
+        }
+        if (/connect(?:ed|ing)/i.test(s.state) && !bleStreaming) {
+          bleStreaming = true;
+          clearReconnectTimer();
+          eegBanner.classList.remove("visible");
+          btn.textContent = "Streaming";
+          btn.disabled = true;
+        }
       };
     } catch (e) {
       console.warn("BLE/WASM unavailable (mock-eeg mode OK):", e);
@@ -362,12 +415,16 @@
 
     btn.onclick = async () => {
       if (!transport) return;
+      clearReconnectTimer();
       btn.disabled = true;
       btn.textContent = "Connecting…";
       try {
         await transport.startStreaming();
+        bleStreaming = true;
+        bleHasDevice = true;
         btn.textContent = "Streaming";
       } catch (err) {
+        bleStreaming = false;
         btn.disabled = false;
         btn.textContent = "Connect Muse";
         setStatus(`BLE error: ${err.message}`);
